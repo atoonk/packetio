@@ -1,0 +1,38 @@
+# Built example binaries: every examples/<name>/ builds to its own directory
+# name, and none of them belong in the repository.
+#
+# Named in full rather than as /examples/*/<name>, because that pattern also
+# matches a *directory* of the same name one level down -- examples/dpdk/info
+# is a package, not a binary, and the wildcard silently ignored all of it.
+/examples/blast/blast
+/examples/drop/drop
+/examples/hello/hello
+/examples/info/info
+/examples/l3fwd/l3fwd
+/examples/send/send
+/examples/steer/steer
+/examples/dpdk/blast/blast
+/examples/dpdk/drop/drop
+/examples/dpdk/info/info
+/examples/dpdk/l3fwd/l3fwd
+
+# Benchmark binaries and their output.
+/pio-blast
+/pio-drop
+/pio-l3fwd
+*.csv
+
+# Go test and profiling output.
+*.test
+*.out
+*.prof
+*.pprof
+
+# Editor and OS noise.
+.DS_Store
+*.swp
+
+# Stray root-level builds.
+/blast
+/sweep
+docs/

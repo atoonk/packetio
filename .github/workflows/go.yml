@@ -1,0 +1,83 @@
+name: build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: build
+        run: go build ./...
+
+      # The root package is portable; only the backends are Linux-only. This
+      # catches a missing build tag, which is otherwise invisible until
+      # somebody on a Mac tries to import the library.
+      - name: cross-build
+        run: GOOS=darwin GOARCH=arm64 go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "$out"; exit 1; fi
+
+      # Everything that needs neither root nor a NIC. The conformance suite
+      # skips itself here and runs in the job below.
+      - name: test
+        run: go test -race ./...
+
+  # Opens real sockets and creates a veth pair, so it needs root. It still
+  # needs no hardware: the afpacket backend and its conformance run entirely
+  # on a veth. The mlx5 and afxdp conformance suites skip without
+  # PACKETIO_IFACE, which no hosted runner has.
+  test-root:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: test as root
+        run: |
+          sudo -E env "PATH=$PATH" PACKETIO_VETH_TESTS=1 \
+            go test -race -count=2 ./afpacket/ ./internal/...
+
+  # The DPDK backend is behind a build tag, so nothing above compiles a line of
+  # it: about three thousand lines of Go and C, including every exported
+  # function of the package, merged green with a syntax error in them until
+  # this job existed. It needs libdpdk but no hardware -- the virtual devices
+  # DPDK ships are enough to open a device, move frames over a veth and run
+  # the conformance suite.
+  dpdk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: install libdpdk
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libdpdk-dev
+      - name: build
+        run: go build -tags dpdk ./...
+      - name: vet
+        run: go vet -tags dpdk ./...
+      # The pure-Go core of the backend: frame ownership and the mbuf
+      # arithmetic, against a fake driver. No DPDK needed to run these.
+      - name: test
+        run: go test -race -tags dpdk ./dpdk/...
+      # A virtual device needs no hugepages and no NIC, so the conformance
+      # suite runs here for real rather than skipping.
+      - name: conformance on a virtual device
+        run: |
+          sudo -E env "PATH=$PATH" PACKETIO_VETH_TESTS=1 PACKETIO_CONFORM_REQUIRED=1 \
+            go test -tags dpdk -count=1 ./dpdk/...
