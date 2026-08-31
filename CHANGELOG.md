@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.0
 
 **afxdp: small fleets get the fast transmit descriptors - +20-30% on
 1-4 queues, inherited from go-afxdp v0.11.0.** mlx5's `xdp_tx_mpwqe`
@@ -170,11 +170,9 @@ And the smaller corrections:
   backend list, the `Capabilities.Backend` values and the README steering
   section.
 
-## v0.1.0
-
-The first release. Nothing has been published before it, so there is nothing to
-be compatible with; what follows is what the release contains and what was
-verified, not a list of changes from a version anyone has.
+The first release. Nothing has been published before it, so there is nothing
+to be compatible with; the rest of this entry is what the release contains and
+what was verified.
 
 ### What it is
 
