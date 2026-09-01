@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"testing"
 	"unsafe"
+
+	"github.com/atoonk/packetio/internal/pool"
 )
 
 // A synthetic TPACKET_V3 ring. The reader only ever touches ring.mem, which is
@@ -162,8 +164,32 @@ func TestRingRetiresBlockAndAdvances(t *testing.T) {
 	armBlock(t, r, 0, 0, ringFrame{data: eth(1, 20)})
 	armBlock(t, r, 1, 0, ringFrame{data: eth(2, 20)})
 
-	if _, n := drain(r, 8, 2048); n != 1 {
-		t.Fatalf("first block: read %d, want 1", n)
+	// One read drains ACROSS consecutive ready blocks: both packets arrive in
+	// a single call, and both blocks go back to the kernel. Splitting every
+	// block into its own delivery was the old behaviour, and it doubled the
+	// caller's passes while holding a finished block hostage.
+	if _, n := drain(r, 8, 2048); n != 2 {
+		t.Fatalf("read %d across two ready blocks, want 2", n)
+	}
+	for b := uint32(0); b < 2; b++ {
+		if st := r.blockDesc(b).blockStatus; st != tpStatusKernel {
+			t.Errorf("block %d status = %d, want handed back to the kernel", b, st)
+		}
+	}
+	if r.block != 2 {
+		t.Errorf("cursor at block %d, want 2", r.block)
+	}
+}
+
+func TestRingBoundedReadStopsAtMax(t *testing.T) {
+	r := newTestRing(4)
+	armBlock(t, r, 0, 0, ringFrame{data: eth(1, 20)})
+	armBlock(t, r, 1, 0, ringFrame{data: eth(2, 20)})
+
+	// max bounds the batch: an emptied block is still released before the
+	// call returns, and the next block waits for the next call.
+	if _, n := drain(r, 1, 2048); n != 1 {
+		t.Fatalf("bounded read %d, want 1", n)
 	}
 	if st := r.blockDesc(0).blockStatus; st != tpStatusKernel {
 		t.Errorf("block 0 status = %d, want handed back to the kernel", st)
@@ -172,7 +198,7 @@ func TestRingRetiresBlockAndAdvances(t *testing.T) {
 		t.Errorf("cursor at block %d, want 1", r.block)
 	}
 	if _, n := drain(r, 8, 2048); n != 1 {
-		t.Errorf("second block: read %d, want 1", n)
+		t.Errorf("second read %d, want the remaining 1", n)
 	}
 }
 
@@ -394,12 +420,50 @@ func TestRingWrapsAtTheLastBlock(t *testing.T) {
 	for b := uint32(0); b < blocks; b++ {
 		armBlock(t, r, b, 0, ringFrame{data: eth(byte(b+1), 20)})
 	}
-	for i := 0; i < blocks; i++ {
-		if _, n := drain(r, 8, 2048); n != 1 {
-			t.Fatalf("block %d: read %d, want 1", i, n)
-		}
+	if _, n := drain(r, 8, 2048); n != blocks {
+		t.Fatalf("read %d, want all %d across the ready blocks", n, blocks)
 	}
 	if r.block != 0 {
 		t.Errorf("cursor at block %d after a full lap, want 0", r.block)
+	}
+}
+
+// A descriptor points frameHeadroom bytes into its frame, so any path that
+// returns a frame to the pool has to round down to the frame start first.
+// Pushing the descriptor address is refused by the pool -- the frame is then
+// lost for the life of the queue -- and that is how the receive path's
+// giveback loop was written when the headroom was introduced.
+func TestPoolTakesFrameStartsNotDescriptorAddresses(t *testing.T) {
+	p := pool.New(0, 4, rxFrameSize)
+	addr := p.Pop(1, nil)[0]
+	free := p.Len()
+
+	p.Push(p.Base(addr + frameHeadroom))
+
+	if p.Len() != free+1 {
+		t.Errorf("frame did not come back: %d free, want %d", p.Len(), free+1)
+	}
+	if r := p.Rejected(); r != 0 {
+		t.Errorf("pool rejected %d pushes, want none", r)
+	}
+}
+
+// A frame must be bigger than the headroom it carries. At frameSize ==
+// frameHeadroom every descriptor would land on the base of the NEXT frame --
+// which the pool still believes is free and would hand to a second owner,
+// while pool.Base sends the wrong frame home. The address is a frame boundary,
+// so no cheap check catches it; the refusal has to happen at Open.
+func TestFrameSizeMustExceedHeadroom(t *testing.T) {
+	for _, size := range []int{64, frameHeadroom} {
+		c := defaults()
+		c.frameSize = size
+		if err := c.validate(); err == nil {
+			t.Errorf("frame size %d accepted, but a packet starts %d bytes in", size, frameHeadroom)
+		}
+	}
+	c := defaults()
+	c.frameSize = 2 * frameHeadroom
+	if err := c.validate(); err != nil {
+		t.Errorf("frame size %d refused: %v", 2*frameHeadroom, err)
 	}
 }

@@ -391,8 +391,31 @@ func (t *Tx) FreeSlots() int {
 		// Assume packets pack as well as the longest one allowed, which is
 		// pessimistic for short packets and never promises room that is not
 		// there.
-		perPacket := (4 + uint64(t.mpw.MaxLen()) + wqe.Octoword - 1) / wqe.Octoword
-		byBlocks := uint64(free) * (wqe.WQEBB / wqe.Octoword) / perPacket
+		// In pointer mode a packet is one octoword of descriptor, not the
+		// copy-mode length cap: MaxLen means nothing here, and deriving the
+		// estimate from it under-reported the default queue's room by ~12x --
+		// Alloc clamped and ringFull tripped while dozens of packets of real
+		// capacity remained.
+		//
+		// The entry's control and Ethernet segments are two octowords that
+		// carry no packet, and Post fills one entry at a time, so the room is
+		// counted in entries: as many full ones as fit, then whatever a
+		// partial one can still hold. Counting packets instead would promise
+		// the headers' worth of room that is not there, and Alloc's guarantee
+		// -- everything it offers, the next Transmit takes -- rests on this
+		// staying pessimistic.
+		var byBlocks uint64
+		if t.mpw.Pointer() {
+			const perEntry = wqe.MaxDS - 2 // packets behind one header
+			const entryBBs = ((2 + perEntry) * wqe.Octoword) / wqe.WQEBB
+			byBlocks = uint64(free/entryBBs) * perEntry
+			if rem := int64(free%entryBBs)*(wqe.WQEBB/wqe.Octoword) - 2; rem > 0 {
+				byBlocks += uint64(rem)
+			}
+		} else {
+			perPacket := (4 + uint64(t.mpw.MaxLen()) + wqe.Octoword - 1) / wqe.Octoword
+			byBlocks = uint64(free) * (wqe.WQEBB / wqe.Octoword) / perPacket
+		}
 		bySlots := uint64(uint32(len(t.slots)) - (t.slotTail - t.slotHead))
 		if byBlocks > bySlots {
 			byBlocks = bySlots

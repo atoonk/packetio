@@ -198,8 +198,8 @@ func TestVethAllocAndFreeRoundTrip(t *testing.T) {
 			t.Fatalf("frame %d handed out twice", d2.Addr)
 		}
 		seen[d2.Addr] = true
-		if w := q.Region().Writable(d2); len(w) != q.Region().FrameSize() {
-			t.Errorf("writable frame is %d bytes, want %d", len(w), q.Region().FrameSize())
+		if w := q.Region().Writable(d2); len(w) != q.Region().FrameSize()-frameHeadroom {
+			t.Errorf("writable frame is %d bytes, want %d", len(w), q.Region().FrameSize()-frameHeadroom)
 		}
 	}
 	q.Free(descs)

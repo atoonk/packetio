@@ -257,8 +257,11 @@ func (d *Device) Capabilities() packetio.Capabilities {
 		SharedRegion:      true,
 		HandsBackFrames:   true,
 		Offload:           d.cfg.gso,
-		MaxFrameSize:      d.cfg.frameSize,
-		MaxQueues:         maxQueues,
+		// What a packet can actually be, not what a frame measures: receive
+		// starts frameHeadroom into the frame so a forwarder has room to
+		// prepend a tag, and those bytes are not available to the packet.
+		MaxFrameSize: d.cfg.frameSize - frameHeadroom,
+		MaxQueues:    maxQueues,
 	}
 }
 

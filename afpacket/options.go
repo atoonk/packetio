@@ -44,14 +44,24 @@ func (c config) validate() error {
 	if c.txQueues > maxQueues || c.rxQueues > maxQueues {
 		return fmt.Errorf("afpacket: at most %d queues either way", maxQueues)
 	}
-	if c.frameSize&(c.frameSize-1) != 0 || c.frameSize < 64 {
-		return fmt.Errorf("afpacket: frame size %d must be a power of two, at least 64", c.frameSize)
+	if c.frameSize&(c.frameSize-1) != 0 || c.frameSize < 2*frameHeadroom {
+		// At least two headrooms: a packet starts frameHeadroom into its
+		// frame, so a frame that size or smaller would put the descriptor at
+		// the base of the NEXT frame -- which the pool still believes is
+		// free, and would hand to a second owner. Refuse it here rather than
+		// hand out two descriptors for one piece of memory.
+		return fmt.Errorf("afpacket: frame size %d must be a power of two of at least %d "+
+			"(a packet starts %d bytes into its frame)", c.frameSize, 2*frameHeadroom, frameHeadroom)
 	}
 	switch {
 	case c.gso && c.frameSize < 1<<16:
 		// A super-frame is one buffer of up to 64 KB, so a region frame has to
 		// hold one whole. Chaining it across small frames would defeat the
 		// point, which is that one descriptor does the work of forty.
+		//
+		// The headroom comes off the top: a 65536-byte frame carries a
+		// super-frame of 65472, which Capabilities.MaxFrameSize reports and
+		// anything larger is counted oversize rather than truncated.
 		return fmt.Errorf("afpacket: WithGSO needs a frame size of at least 65536, not %d "+
 			"(a segmentation-offload super-frame is one buffer of up to 64 KB)", c.frameSize)
 	case !c.gso && c.frameSize > rxFrameSize:
@@ -97,8 +107,9 @@ func WithFrames(n int) Option {
 	return func(c *config) { c.frames, c.framesSet = n, true }
 }
 
-// WithFrameSize sets the size of one frame, which is the largest packet this
-// device can carry. It must be a power of two and no larger than the 2048-byte
+// WithFrameSize sets the size of one frame. A packet starts a little way into
+// its frame, so the largest packet is smaller than this; ask
+// Capabilities().MaxFrameSize rather than assuming. It must be a power of two and no larger than the 2048-byte
 // ring frame the kernel receives into.
 func WithFrameSize(n int) Option { return func(c *config) { c.frameSize = n } }
 

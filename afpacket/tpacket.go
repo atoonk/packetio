@@ -280,90 +280,97 @@ func (r *ring) advance(next uint32) {
 // buffer is skipped without producing output, and the caller is expected to
 // hand back the same buffer rather than a fresh one.
 func (r *ring) read(max int, dst func(i int) []byte, lens []int, offs []packetio.Offload) int {
-	bd := r.blockDesc(r.block)
-	if atomic.LoadUint32(&bd.blockStatus)&tpStatusUser == 0 {
-		return 0
-	}
-	blockOff := r.block * r.blockSize
-	if !r.pending {
-		r.numPkts = bd.numPkts
-		r.frameOff = bd.offsetToFirst
-	}
-	r.pending = false
-
 	out := 0
-	for r.numPkts > 0 && out < max {
-		if !r.frameHdrFits(r.frameOff) {
-			r.oversize.Add(1)
-			r.numPkts = 0
+	// Drain consecutive ready blocks until max is met or the ring runs dry.
+	// Each block goes back to the kernel the moment it is empty -- holding a
+	// finished block across the caller's processing pass starves the ring
+	// under pressure for no benefit.
+blocks:
+	for out < max {
+		bd := r.blockDesc(r.block)
+		if atomic.LoadUint32(&bd.blockStatus)&tpStatusUser == 0 {
 			break
 		}
-		frameOff := blockOff + r.frameOff
-		tph := r.frameHdr(frameOff)
-		next := tph.tpNextOffset
-		if !r.frameInBlock(r.frameOff, tph) {
-			r.oversize.Add(1)
-			r.numPkts = 0
-			break
+		blockOff := r.block * r.blockSize
+		if !r.pending {
+			r.numPkts = bd.numPkts
+			r.frameOff = bd.offsetToFirst
 		}
-		buf := dst(out)
-		if buf == nil { // no free frame: leave the rest of the block for later
-			break
-		}
-		plen := int(tph.tpSnaplen)
-		d := frameOff + uint32(tph.tpMac)
+		r.pending = false
 
-		// The kernel strips the 802.1Q tag into the frame header. Put it back,
-		// so what the caller sees is what was on the wire.
-		tagLen, tpid, tci := 0, uint16(0), uint16(0)
-		if tph.tpStatus&tpStatusVlanValid != 0 && plen >= 12 {
-			if tpid = tph.tpVlanTpid; tpid == 0 {
-				tpid = 0x8100
+		for r.numPkts > 0 && out < max {
+			if !r.frameHdrFits(r.frameOff) {
+				r.oversize.Add(1)
+				r.numPkts = 0
+				break
 			}
-			tci = uint16(tph.tpVlanTci)
-			tagLen = 4
-		}
-		if plen+tagLen > len(buf) {
-			// Does not fit: count it and skip it. Delivering a clamped length
-			// instead would make an oversized frame look like a frame-sized
-			// packet, with nothing saying otherwise.
-			r.oversize.Add(1)
-			r.advance(next)
-			continue
-		}
-		if tagLen != 0 {
-			copy(buf[0:12], r.mem[d:d+12])
-			buf[12], buf[13] = byte(tpid>>8), byte(tpid)
-			buf[14], buf[15] = byte(tci>>8), byte(tci)
-			copy(buf[16:], r.mem[d+12:d+uint32(plen)])
-		} else {
-			copy(buf, r.mem[d:d+uint32(plen)])
-		}
-		lens[out] = plen + tagLen
-		if offs != nil {
-			var o packetio.Offload
-			if r.vnet {
-				o = packetio.UnmarshalOffload(r.mem[d-packetio.OffloadHdrLen : d])
-				// csum_start is measured from the start of the frame, so it
-				// moves with a tag put back in front of it.
-				if tagLen != 0 && o.Flags&packetio.OffloadNeedsCsum != 0 {
-					o.CsumStart += uint16(tagLen)
-					if o.HdrLen != 0 {
-						o.HdrLen += uint16(tagLen)
+			frameOff := blockOff + r.frameOff
+			tph := r.frameHdr(frameOff)
+			next := tph.tpNextOffset
+			if !r.frameInBlock(r.frameOff, tph) {
+				r.oversize.Add(1)
+				r.numPkts = 0
+				break
+			}
+			buf := dst(out)
+			if buf == nil { // no free frame: leave the rest of the block for later
+				break
+			}
+			plen := int(tph.tpSnaplen)
+			d := frameOff + uint32(tph.tpMac)
+
+			// The kernel strips the 802.1Q tag into the frame header. Put it back,
+			// so what the caller sees is what was on the wire.
+			tagLen, tpid, tci := 0, uint16(0), uint16(0)
+			if tph.tpStatus&tpStatusVlanValid != 0 && plen >= 12 {
+				if tpid = tph.tpVlanTpid; tpid == 0 {
+					tpid = 0x8100
+				}
+				tci = uint16(tph.tpVlanTci)
+				tagLen = 4
+			}
+			if plen+tagLen > len(buf) {
+				// Does not fit: count it and skip it. Delivering a clamped length
+				// instead would make an oversized frame look like a frame-sized
+				// packet, with nothing saying otherwise.
+				r.oversize.Add(1)
+				r.advance(next)
+				continue
+			}
+			if tagLen != 0 {
+				copy(buf[0:12], r.mem[d:d+12])
+				buf[12], buf[13] = byte(tpid>>8), byte(tpid)
+				buf[14], buf[15] = byte(tci>>8), byte(tci)
+				copy(buf[16:], r.mem[d+12:d+uint32(plen)])
+			} else {
+				copy(buf, r.mem[d:d+uint32(plen)])
+			}
+			lens[out] = plen + tagLen
+			if offs != nil {
+				var o packetio.Offload
+				if r.vnet {
+					o = packetio.UnmarshalOffload(r.mem[d-packetio.OffloadHdrLen : d])
+					// csum_start is measured from the start of the frame, so it
+					// moves with a tag put back in front of it.
+					if tagLen != 0 && o.Flags&packetio.OffloadNeedsCsum != 0 {
+						o.CsumStart += uint16(tagLen)
+						if o.HdrLen != 0 {
+							o.HdrLen += uint16(tagLen)
+						}
 					}
 				}
+				offs[out] = o
 			}
-			offs[out] = o
+			out++
+			r.advance(next)
 		}
-		out++
-		r.advance(next)
-	}
 
-	if r.numPkts == 0 {
+		if r.numPkts != 0 {
+			r.pending = true
+			break blocks
+		}
 		atomic.StoreUint32(&bd.blockStatus, tpStatusKernel)
 		r.block = (r.block + 1) % r.blockNr
-	} else {
-		r.pending = true
 	}
 	r.packets.Add(uint64(out))
 	return out

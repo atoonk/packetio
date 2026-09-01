@@ -661,8 +661,12 @@ func (d *Device) Capabilities() packetio.Capabilities {
 		BlockingPoll:      false, // polling only, for now
 		SharedRegion:      true,
 		HandsBackFrames:   true,
-		MaxFrameSize:      d.info.FrameSize,
-		MaxQueues:         maxQueues,
+		// What a packet can actually be on receive, not what a frame
+		// measures: the ring posts buffers rxHeadroom into the frame so a
+		// forwarder has room to prepend, and those bytes are not available
+		// to an arriving packet.
+		MaxFrameSize: d.info.FrameSize - rxHeadroom,
+		MaxQueues:    maxQueues,
 	}
 }
 

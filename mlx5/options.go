@@ -77,6 +77,12 @@ func (c *config) validate(dev string) error {
 		return fmt.Errorf("mlx5: a receive queue of %d, which must be a power of two", c.rxDepth)
 	case c.frameSize < 64 || c.frameSize&(c.frameSize-1) != 0:
 		return fmt.Errorf("mlx5: a frame size of %d, which must be a power of two of at least 64", c.frameSize)
+	case c.rxQueues > 0 && c.frameSize <= rxHeadroom:
+		// Received packets start rxHeadroom into the frame, so a frame this
+		// small could hold no packet at all; refuse it here with the reason
+		// rather than deep in the ring with "buffers of no bytes".
+		return fmt.Errorf("mlx5: %d-byte frames leave no room for a packet behind the "+
+			"%d-byte receive headroom; use at least %d", c.frameSize, rxHeadroom, rxHeadroom*2)
 	case c.frames <= 0:
 		return fmt.Errorf("mlx5: %d frames", c.frames)
 	case c.frames > maxFrames:
@@ -181,8 +187,9 @@ func WithSteering(f packetio.SteeringFilter) Option {
 	return func(c *config) { c.steering = f }
 }
 
-// WithFrameSize sets the size of one frame, which is the largest packet that
-// fits in one. It must be a power of two.
+// WithFrameSize sets the size of one frame. It must be a power of two. A
+// received packet starts a little way into its frame, so the largest packet is
+// smaller than this; ask Capabilities().MaxFrameSize rather than assuming.
 func WithFrameSize(n int) Option { return func(c *config) { c.frameSize = n } }
 
 // WithFrames sets how many frames the region holds, across every queue.

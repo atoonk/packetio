@@ -130,7 +130,10 @@ func (q *TxQueue) Alloc(n int) []packetio.Desc {
 	q.addrs = q.pool.Pop(min(n, q.NumFreeSlots()), q.addrs[:0])
 	q.descs = q.descs[:0]
 	for _, a := range q.addrs {
-		q.descs = append(q.descs, packetio.Desc{Addr: a})
+		// The same headroom Receive gives, for the same two reasons; see
+		// frameHeadroom. Free and Complete round down with pool.Base, so a
+		// frame goes home whole regardless of the offset it was used at.
+		q.descs = append(q.descs, packetio.Desc{Addr: a + frameHeadroom})
 	}
 	return q.descs
 }

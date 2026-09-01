@@ -55,6 +55,14 @@ type RxQueue struct {
 	closed atomic.Bool
 }
 
+// rxHeadroom is where a received packet starts within its frame: one cache
+// line in, not zero -- the afpacket backend's frameHeadroom, for the same two
+// measured reasons. This was the only backend delivering packets at offset
+// zero of a constant-strided frame, which handed every caller with its own
+// strided buffers a 4 KiB-aliasing candidate and left a VLAN push nowhere to
+// grow (the growth-room gap cx6dx-l3fwd.md already records as outstanding).
+const rxHeadroom = 64
+
 func (d *Device) newRxQueue(index, firstFrame, frames int) (*RxQueue, error) {
 	dvq, err := d.dev.CreateRxQueue(d.cfg.rxDepth)
 	if err != nil {
@@ -62,15 +70,17 @@ func (d *Device) newRxQueue(index, firstFrame, frames int) (*RxQueue, error) {
 	}
 
 	r, err := ring.NewRx(ring.RxConfig{
-		RQ:         dvq.RQ,
-		CQ:         dvq.CQ,
-		RQDbrec:    dvq.RQDbrec,
-		CQDbrec:    dvq.CQDbrec,
-		Stride:     dvq.Stride,
-		LKey:       d.dev.LKey(),
-		Region:     d.region.b,
-		RegionVA:   d.region.va(),
-		BufferSize: uint32(d.cfg.frameSize),
+		RQ:       dvq.RQ,
+		CQ:       dvq.CQ,
+		RQDbrec:  dvq.RQDbrec,
+		CQDbrec:  dvq.CQDbrec,
+		Stride:   dvq.Stride,
+		LKey:     d.dev.LKey(),
+		Region:   d.region.b,
+		RegionVA: d.region.va(),
+		// The NIC writes after the headroom, so it must not be allowed to
+		// run to the end of the frame plus it.
+		BufferSize: uint32(d.cfg.frameSize - rxHeadroom),
 	})
 	if err != nil {
 		dvq.Close()
@@ -150,7 +160,7 @@ func (q *RxQueue) Fill(n int) int {
 	q.addrs = q.pool.Pop(n, q.addrs[:0])
 	q.fill = q.fill[:0]
 	for _, addr := range q.addrs {
-		q.fill = append(q.fill, packetio.Desc{Addr: addr})
+		q.fill = append(q.fill, packetio.Desc{Addr: addr + rxHeadroom})
 	}
 	posted := q.ring.Fill(q.fill)
 

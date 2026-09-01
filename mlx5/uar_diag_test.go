@@ -18,7 +18,11 @@ func TestUARsPerQueue(t *testing.T) {
 	if iface == "" {
 		t.Skip("set PACKETIO_IFACE")
 	}
-	d, err := Open(iface, WithTxQueues(8), WithRxQueues(0), WithFrames(8192))
+	// No WithFrames: the backend sizes the region for the rings it opens.
+	// A fixed 8192 predates the refuse-don't-raise rule and the 4-rings-per-
+	// queue default, whose 32 rings need four times that; pinning the count
+	// here made this diagnostic fail at Open on both counts.
+	d, err := Open(iface, WithTxQueues(8), WithRxQueues(0))
 	if err != nil {
 		t.Fatal(err)
 	}

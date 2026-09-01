@@ -104,7 +104,8 @@ func (r *region) Writable(d packetio.Desc) []byte {
 	return r.b[d.Addr:end:end]
 }
 
-// FrameSize is the size of one frame, and the largest packet that fits in one.
+// FrameSize is the size of one frame. The largest packet a frame can
+// receive is rxHeadroom bytes smaller; Capabilities.MaxFrameSize says so.
 func (r *region) FrameSize() int { return r.frameSize }
 
 // NumFrames is how many frames the region holds.

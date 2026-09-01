@@ -1191,3 +1191,34 @@ func TestMultiPacketPointerOwnershipOverManyLaps(t *testing.T) {
 		t.Fatalf("%d descriptors refused", got)
 	}
 }
+
+// FreeSlots in pointer mode: a packet costs one octoword of descriptor, so an
+// empty queue must offer on the order of blocks*4 packets, not blocks*4/13.
+// The old estimate divided by the copy-mode length cap (MaxLen, default 192 ->
+// 13 octowords), which is meaningless for pointer entries; Alloc then clamped
+// to a fraction of the real capacity and ringFull tripped with room to spare.
+// The estimate must also be honest the other way: everything it offers, one
+// Post must actually take.
+func TestFreeSlotsPointerMode(t *testing.T) {
+	const blocks = 16
+	// mpwMaxLen mirrors the real device: mlx5/txqueue.go passes the copy-mode
+	// cap (default 192) even to a pointer sender, which is exactly how the
+	// old estimate came to divide by it.
+	r := newRig(t, rigOpts{blocks: blocks, cqEntries: blocks, frames: 64,
+		multiPacket: true, mpwPointer: true, mpwMaxLen: 192})
+
+	free := r.tx.FreeSlots()
+	if free < blocks*2 {
+		t.Fatalf("empty pointer-mode queue offers %d packets; the old MaxLen-derived "+
+			"estimate gave %d and starved the ring", free, blocks*4/13)
+	}
+	// The offer is real capacity, not optimism: post it all in one batch.
+	descs := make([]packetio.Desc, 0, free)
+	for i := 0; i < free; i++ {
+		descs = append(descs, r.desc(i%64, 64))
+	}
+	if n := r.post(descs); n < free {
+		t.Fatalf("FreeSlots offered %d but Post took %d; the estimate promises room that "+
+			"is not there, and Alloc's no-leak guarantee rests on it", free, n)
+	}
+}

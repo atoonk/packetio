@@ -84,6 +84,18 @@ func newRxQueue(r *region, fd int, rg *ring, firstFrame, frames int) (*RxQueue, 
 // Region is the frame memory this queue receives into.
 func (q *RxQueue) Region() packetio.Region { return q.region }
 
+// frameHeadroom is where a packet starts within its frame -- received OR
+// allocated: one cache line in, not zero. Two reasons, both measured. A
+// forwarder that must prepend a longer link-layer header (a VLAN push) needs
+// room before the packet, and a packet at offset zero has none. And on Zen,
+// a transmit copy whose source and destination share a page offset (both
+// frame stores and the kernel's skb slab are 2048-strided) serializes on
+// 4 KiB-aliasing false dependencies -- measured at 933 versus 188 cycles for
+// one 1500-byte packet -- and one line of offset moves the copy out of the
+// window. Alloc takes the same offset as Receive, because a generated packet
+// goes through the same sendmmsg as a forwarded one.
+const frameHeadroom = 64
+
 // Fill reports how many frames are free to receive into. The kernel owns the
 // ring it fills, so there is nothing to post; this exists so that code written
 // against the other backends works unchanged.
@@ -198,9 +210,13 @@ func (q *RxQueue) receive(max int) ([]packetio.Desc, []packetio.Offload) {
 	if q.closed.Load() || max <= 0 {
 		return nil, nil
 	}
-	// One block is all a single call can produce, so a caller asking for more
-	// only reserves memory it cannot use.
-	max = min(max, int(q.ring.blockSize/rxFrameSize))
+	// The old cap here -- blockSize/frameSize -- came from a TPACKET_V3 field
+	// the kernel does not use as a delivery bound: V3 packs frames into a
+	// block by BYTES, so a 64 KiB block holds ~40 full-size packets, not 32,
+	// and hundreds of small ones. Capping at 32 split every block into two
+	// deliveries and held the block from the kernel across the caller's whole
+	// processing pass. The ring now drains across consecutive ready blocks up
+	// to the caller's max, like every other backend.
 	if cap(q.lens) < max {
 		q.lens = make([]int, max)
 	}
@@ -221,14 +237,18 @@ func (q *RxQueue) receive(max int) ([]packetio.Desc, []packetio.Offload) {
 		if len(q.addrs) == 0 {
 			return nil
 		}
-		q.descs = append(q.descs, packetio.Desc{Addr: q.addrs[0]})
+		q.descs = append(q.descs, packetio.Desc{Addr: q.addrs[0] + frameHeadroom})
 		return q.region.Writable(q.descs[i])
 	}, q.lens[:max], q.offs[:max])
 
 	// A frame may have been taken for a slot that produced nothing, when the
-	// walk ended on an oversized frame. Give those back.
+	// walk ended on an oversized frame. Give those back -- by frame start,
+	// because a descriptor points frameHeadroom bytes into its frame and the
+	// pool refuses an address that is not a frame boundary. Pushing the
+	// descriptor address instead loses the frame for the life of the queue
+	// and counts it in Rejected.
 	for i := len(q.descs) - 1; i >= got; i-- {
-		q.pool.Push(q.descs[i].Addr)
+		q.pool.Push(q.pool.Base(q.descs[i].Addr))
 	}
 	q.descs = q.descs[:got]
 	var bytes uint64
@@ -247,6 +267,12 @@ func (q *RxQueue) receive(max int) ([]packetio.Desc, []packetio.Offload) {
 	// A frame the kernel says carries a partial checksum has only the
 	// pseudo-header sum in its checksum field. Finish it here, or everything
 	// downstream sees a corrupt packet.
+	// Without a vnet header the kernel never reports a partial checksum, and
+	// this loop would still walk every descriptor to discover that; skip it
+	// outright on the configuration nearly everyone runs.
+	if !q.ring.vnet {
+		return q.descs, q.offs[:got]
+	}
 	for i := range q.descs {
 		o := &q.offs[i]
 		if o.Flags&packetio.OffloadNeedsCsum == 0 {
@@ -261,6 +287,18 @@ func (q *RxQueue) receive(max int) ([]packetio.Desc, []packetio.Offload) {
 	}
 	return q.descs, q.offs[:got]
 }
+
+// Fd is the receive socket's file descriptor, for a caller that must wait on
+// several queues at once.
+//
+// Poll covers the ordinary case: one queue, its own wakeup on close. A caller
+// driving several devices from one goroutine needs them all in a single
+// poll(2) alongside its own wake descriptors, and cannot get that by calling
+// Poll per queue. This is the afpacket twin of the afxdp backend's Socket().
+//
+// The descriptor belongs to the queue: poll it, do not read, close, or
+// otherwise operate on it, and do not use it after Close.
+func (q *RxQueue) Fd() int { return q.fd }
 
 // Recycle returns received frames to the pool. A frame this pool does not own
 // is refused there and counted, not silently accepted.
@@ -277,7 +315,9 @@ func (q *RxQueue) NumFreeFillSlots() int { return q.pool.Len() }
 // NumFreeFrames is how many frames are in the free pool.
 func (q *RxQueue) NumFreeFrames() int { return q.pool.Len() }
 
-// NumReceived is how many packets Receive would return now.
+// NumReceived is at least how many packets Receive would return now: it counts
+// the block the ring is on, and Receive drains across every block that is
+// ready, so a busy queue often has more waiting than this reports.
 func (q *RxQueue) NumReceived() int {
 	if q.closed.Load() {
 		return 0

@@ -51,15 +51,18 @@ func TestAllocGivesFramesInsideItsOwnSliceOfTheRegion(t *testing.T) {
 			if d.Addr < lo || d.Addr >= hi {
 				t.Fatalf("queue %d: frame at %d is outside its range [%d,%d)", q, d.Addr, lo, hi)
 			}
-			if d.Addr%frameSize != 0 {
-				t.Errorf("queue %d: frame at %d is not frame-aligned", q, d.Addr)
+			// Alloc points frameHeadroom into the frame, the same offset
+			// Receive delivers at: room to prepend, and a copy source that
+			// stays out of the 4 KiB-aliasing window (see frameHeadroom).
+			if d.Addr%frameSize != frameHeadroom {
+				t.Errorf("queue %d: frame at %d is not headroom-offset", q, d.Addr)
 			}
 			if seen[d.Addr] {
 				t.Fatalf("queue %d: frame %d handed out twice", q, d.Addr)
 			}
 			seen[d.Addr] = true
-			if w := r.Writable(d); len(w) != frameSize {
-				t.Fatalf("queue %d: Writable(%d) is %d bytes, want %d", q, d.Addr, len(w), frameSize)
+			if w := r.Writable(d); len(w) != frameSize-frameHeadroom {
+				t.Fatalf("queue %d: Writable(%d) is %d bytes, want %d", q, d.Addr, len(w), frameSize-frameHeadroom)
 			}
 		}
 	}
