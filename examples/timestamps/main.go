@@ -1,3 +1,5 @@
+//go:build linux
+
 // Command timestamps shows when packets actually arrived, using the time the
 // device recorded for each one rather than the time this program got round to
 // looking.
