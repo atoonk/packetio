@@ -33,6 +33,7 @@ run as written.
     WithSocketBuffer(bytes)
     WithPromiscuous()
     WithGSO()                 segmentation and checksum metadata per frame
+    WithMultiBuffer()         a received packet may span several frames
 
 There is no `WithSteering` and no affinity option, and both absences are
 deliberate - see below.
@@ -48,7 +49,9 @@ descs, ts := rx.ReceiveTimestamps(256)
 ```
 
 It costs nothing to offer, because the kernel writes the field whether or not
-it is read. The clock is CLOCK_REALTIME as the frame went into the ring, not a
+it is read. Note that with receive offloads on, the kernel coalesces segments
+into one super-frame and stamps that once, when it coalesced: a measurement
+over such a link sees a fraction of the packets it thinks it does. The clock is CLOCK_REALTIME as the frame went into the ring, not a
 NIC reading off the wire, so it includes the trip up through the kernel and it
 can step when the wall clock is adjusted. For a time taken on the wire use a
 card that stamps, such as [mlx5](../mlx5/).
@@ -57,6 +60,70 @@ Offload metadata does not come back on this path: a device opened `WithGSO`
 that needs both should use `ReceiveOffload`.
 [`examples/timestamps`](../examples/timestamps) is a jitter meter built on this
 and runs anywhere.
+
+## Sending from your own memory
+
+A packet does not have to live in this backend's region to be sent:
+
+```go
+if g, ok := d.TxQueue(0).(packetio.GatherTransmitter); ok {
+        n, err := g.TransmitGather(segs, counts, nil)   // segs are yours
+}
+```
+
+`sendmmsg` copies into the kernel before it returns, so there is nothing to
+wait for and nothing to hand back: no frame is taken from the pool, no packet
+pends, and `Complete` has nothing of this to give. `segs` holds every packet's
+slices back to back and `counts[i]` is how many belong to packet i, so one
+packet may be as many pieces as you have.
+
+It is for a forwarder whose packets already sit in its own buffers. Copying
+them into the region first protects against a device reading the memory after
+the call, and here none does, so it is a copy of every byte for nothing. No
+backend with a NIC doing its own DMA can offer this: `Capabilities().GatherTx`
+says who can.
+
+## Receiving a packet too big for a frame
+
+`WithGSO` makes the kernel hand you TCP super-frames of up to 64 KB whole. The
+straightforward way to hold one is a 64 KB frame, and that is what `WithGSO`
+sets up on its own: 256 of them, 16 MiB. It works, and for a forwarder it is a
+lot of memory to move a packet through.
+
+`WithMultiBuffer` is the other answer. Keep small frames and let a big packet
+lie across as many as it takes:
+
+```go
+d, _ := afpacket.Open("eth0", afpacket.WithGSO(),
+        afpacket.WithFrameSize(2048), afpacket.WithMultiBuffer())
+
+for _, desc := range d.RxQueue(0).Receive(64) {
+        if desc.Options&packetio.OptContinued != 0 {
+                // more of this packet follows in the next descriptor
+        }
+}
+```
+
+Every descriptor but the last of a packet carries `OptContinued`, the same
+convention AF_XDP uses. Three things follow from a packet being several
+descriptors:
+
+- **The metadata is the packet's, not the frame's.** `ReceiveOffload` puts the
+  `Offload` on the first descriptor; the rest are zero.
+- **A partial checksum is yours to finish.** An ordinary frame gets its
+  checksum completed here. A chained one cannot: no single frame holds all the
+  bytes the sum covers, so `OffloadNeedsCsum` stays set and you finish it after
+  you have put the packet back together. Nothing will tell you if you forget -
+  the packet goes out with an unfinished sum.
+- **Size your batch for the traffic.** A packet needs
+  `ceil(len / MaxFrameSize)` slots. If it needs more than the whole `max` you
+  passed, no call of that size could ever deliver it, so it is dropped and
+  counted rather than retried forever. 64 KB over 2 KB frames means `max` of at
+  least 33.
+
+Transmit has always been able to do this: hand `Transmit` a chain marked the
+same way and the kernel gathers it. `Capabilities().MultiBuffer` reports both
+halves.
 
 ## Why there is no steering
 

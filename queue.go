@@ -54,7 +54,10 @@ type TxQueue interface {
 	Alloc(n int) []Desc
 
 	// Transmit hands descriptors to the NIC and returns how many it accepted,
-	// always a prefix of descs. Frames in the accepted prefix now belong to
+	// always a prefix of descs -- and, where a backend carries a packet as
+	// several frames chained with OptContinued, a prefix of whole packets:
+	// half a packet accepted would leave the caller with a tail nothing can
+	// interpret. Frames in the accepted prefix now belong to
 	// the NIC and must not be touched until Complete or Reclaim returns them.
 	// Frames in the unaccepted suffix still belong to the caller, who must
 	// transmit them later or return them with Free. No backend returns an
@@ -169,8 +172,13 @@ type RxQueue interface {
 	Poll(timeout time.Duration) (int, error)
 
 	// Receive takes up to max received packets and returns their descriptors.
-	// The frames belong to the caller until Recycle. The returned slice is
-	// owned by the queue and is reused by the next call.
+	// The returned slice is owned by the queue and is reused by the next call.
+	//
+	// The frames belong to the caller until Recycle, and belong to it alone:
+	// no later Receive, no Fill, nothing the queue does in between writes to
+	// one, hands it out again, or moves it, and Region.Bytes is one mapping
+	// for the life of the device. So a forwarder may carry received frames
+	// through whatever it does next rather than copying them out first.
 	Receive(max int) []Desc
 
 	// Err reports that the queue is out of service, or nil while it is
@@ -262,6 +270,16 @@ type Capabilities struct {
 
 	// RxChecksumFlags is true when received descriptors carry OptChecksumOK.
 	RxChecksumFlags bool
+
+	// GatherTx is true when the transmit queues implement
+	// [GatherTransmitter], so a packet may be sent straight out of the
+	// caller's memory without being copied into a frame first.
+	//
+	// It is false wherever the hardware reads the bytes after the call
+	// returns, which is every device that does its own DMA: there the memory
+	// has to be registered first, and a Region is what registered memory
+	// looks like here.
+	GatherTx bool
 
 	// RxTimestamps is true when the receive queues implement
 	// [TimestampReceiver], so every packet arrives with the time the device

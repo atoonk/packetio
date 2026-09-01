@@ -104,6 +104,37 @@ type OffloadReceiver interface {
 	ReceiveOffload(max int) ([]Desc, []Offload)
 }
 
+// GatherTransmitter is implemented by a transmit queue that can send a packet
+// out of the caller's own memory, rather than out of frames taken from its
+// pool. Use it through a type assertion, and only where
+// [Capabilities.GatherTx] is true:
+//
+//	if g, ok := tq.(packetio.GatherTransmitter); ok {
+//	        n, err := g.TransmitGather(segs, counts, offs)
+//	}
+//
+// It exists for a caller whose packets already sit in its own buffers -- a
+// forwarder carrying one packet as several -- for which copying them into the
+// queue's region first is a copy of every byte that buys nothing.
+//
+// Only a backend whose hardware has finished with the memory by the time the
+// call returns can offer it. AF_PACKET can, because the kernel copies into an
+// skb before sendmmsg returns. A NIC that reads the bytes by DMA long
+// afterwards cannot: its memory has to be registered with the device first,
+// which is what a Region is.
+type GatherTransmitter interface {
+	TxQueue
+
+	// TransmitGather sends packets whose bytes are the caller's. segs holds
+	// every packet's slices back to back, counts[i] is how many belong to
+	// packet i, and offs, when not nil, is one Offload per packet.
+	//
+	// It returns how many packets were accepted, always a prefix, and takes a
+	// packet whole or not at all. There is nothing to complete or reclaim:
+	// the memory is the caller's again as soon as this returns.
+	TransmitGather(segs [][]byte, counts []int, offs []Offload) (int, error)
+}
+
 // OffloadTransmitter is implemented by a transmit queue that can carry offload
 // metadata alongside each frame, so a super-frame is segmented by the kernel or
 // the peer rather than here.

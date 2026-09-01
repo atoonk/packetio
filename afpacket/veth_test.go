@@ -643,3 +643,603 @@ func TestVethReceiveTimestamps(t *testing.T) {
 	}
 	rx.Recycle(rx.Receive(16))
 }
+
+// A frame sent with only its pseudo-header partial must arrive completed, and
+// the completed value must be the real checksum -- not merely "something was
+// written". An earlier version of this test asserted neither: it sent an
+// already-complete frame, so its one check sat behind a condition that was
+// never true, and it survived a deliberate mutation that corrupted every
+// checksum in the package.
+func TestVethPartialChecksumIsCompletedCorrectly(t *testing.T) {
+	needRoot(t)
+	name, peer := vethPair(t)
+
+	rx, err := Open(name, WithTxQueues(0), WithRxQueues(1), WithGSO(), WithPromiscuous())
+	if err != nil {
+		t.Skipf("cannot open a GSO device here: %v", err)
+	}
+	defer rx.Close()
+	tx, err := Open(peer, WithTxQueues(1), WithRxQueues(0), WithGSO())
+	if err != nil {
+		t.Skipf("cannot open a GSO sender here: %v", err)
+	}
+	defer tx.Close()
+
+	pkt, hdrLen, csumStart, csumOff := tcpSegment(64)
+	// What the checksum must come out as: the sum over the L4 range with the
+	// partial in place, computed here rather than by the code under test.
+	want := onesComplement(pkt[csumStart:])
+	if want == 0 {
+		want = 0xffff
+	}
+
+	q := rx.RxQueue(0).(packetio.OffloadReceiver)
+	q.Fill(q.NumFreeFillSlots())
+
+	txq := tx.TxQueue(0).(packetio.OffloadTransmitter)
+	descs := txq.Alloc(1)
+	if len(descs) == 0 {
+		t.Fatal("no frames to send with")
+	}
+	copy(tx.Region().Writable(descs[0]), pkt)
+	descs[0].Len = uint32(len(pkt))
+	offs := []packetio.Offload{{
+		Flags:     packetio.OffloadNeedsCsum,
+		HdrLen:    uint16(hdrLen),
+		CsumStart: uint16(csumStart),
+		CsumOff:   uint16(csumOff),
+	}}
+	if n, err := txq.TransmitOffload(descs, offs); err != nil || n != 1 {
+		t.Fatalf("TransmitOffload: %d sent, %v", n, err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := q.Poll(200 * time.Millisecond); err != nil {
+			t.Fatalf("poll: %v", err)
+		}
+		got, offs := q.ReceiveOffload(16)
+		for i, d := range got {
+			b := q.Region().Frame(d)
+			if !ours(b) || len(b) < csumStart+csumOff+2 {
+				continue
+			}
+			if offs[i].Segmented() {
+				continue // not what this test is about
+			}
+			sum := uint16(b[csumStart+csumOff])<<8 | uint16(b[csumStart+csumOff+1])
+			if sum != want {
+				t.Errorf("checksum on delivery is %#04x, want %#04x", sum, want)
+			}
+			if offs[i].Flags&packetio.OffloadNeedsCsum != 0 {
+				t.Error("a completed frame still asks to be completed")
+			}
+			q.Recycle(got)
+			return
+		}
+		q.Recycle(got)
+		q.Fill(q.NumFreeFillSlots())
+	}
+	t.Skip("nothing arrived on the veth pair")
+}
+
+// A packet may arrive as several frames chained with OptContinued, so a
+// forwarder carrying a coalesced super-frame as a chain of pool buffers can
+// hand it to the kernel as it is, instead of copying it into one contiguous
+// frame first. What arrives must be the concatenation, byte for byte.
+func TestVethMultiBufferTransmit(t *testing.T) {
+	needRoot(t)
+	name, peer := vethPair(t)
+
+	rx, err := Open(name, WithTxQueues(0), WithRxQueues(1), WithPromiscuous())
+	if err != nil {
+		t.Fatalf("open receiver: %v", err)
+	}
+	defer rx.Close()
+	tx, err := Open(peer, WithTxQueues(1), WithRxQueues(0))
+	if err != nil {
+		t.Fatalf("open sender: %v", err)
+	}
+	defer tx.Close()
+
+	// One packet in three pieces, and one ordinary packet after it, so the
+	// mixed case is covered by the same run.
+	whole := frame(1, 300)
+	pieces := [][]byte{whole[:100], whole[100:180], whole[180:]}
+	plain := frame(2, 120)
+
+	txq := tx.TxQueue(0)
+	descs := txq.Alloc(4)
+	if len(descs) < 4 {
+		t.Fatalf("Alloc gave %d frames, want 4", len(descs))
+	}
+	for i, p := range pieces {
+		copy(tx.Region().Writable(descs[i]), p)
+		descs[i].Len = uint32(len(p))
+		if i < len(pieces)-1 {
+			descs[i].Options |= packetio.OptContinued
+		}
+	}
+	copy(tx.Region().Writable(descs[3]), plain)
+	descs[3].Len = uint32(len(plain))
+
+	before := txq.NumFreeFrames()
+	if n := txq.Transmit(descs); n != 4 {
+		t.Fatalf("Transmit took %d of 4 frames: %v", n, txq.Err())
+	}
+
+	rxq := rx.RxQueue(0)
+	rxq.Fill(rxq.NumFreeFillSlots())
+	var got [][]byte
+	deadline := time.Now().Add(3 * time.Second)
+	for len(got) < 2 && time.Now().Before(deadline) {
+		if _, err := rxq.Poll(200 * time.Millisecond); err != nil {
+			t.Fatalf("poll: %v", err)
+		}
+		ds := rxq.Receive(8)
+		for _, d := range ds {
+			if f := rxq.Region().Frame(d); ours(f) {
+				got = append(got, append([]byte(nil), f...))
+			}
+		}
+		rxq.Recycle(ds)
+		rxq.Fill(rxq.NumFreeFillSlots())
+	}
+	if len(got) < 2 {
+		t.Fatalf("received %d packets, want 2", len(got))
+	}
+	// The chain must arrive as ONE packet, reassembled by the kernel from the
+	// iovecs, not as three.
+	if !bytes.Equal(got[0], whole) {
+		t.Errorf("the chained packet arrived as %d bytes, want the %d-byte concatenation",
+			len(got[0]), len(whole))
+	}
+	if !bytes.Equal(got[1], plain) {
+		t.Errorf("the ordinary packet after a chain did not survive it")
+	}
+
+	// Every frame of the chain is an ordinary frame again once it is sent.
+	if n := txq.Complete(8); n != 4 {
+		t.Errorf("Complete returned %d frames, want all 4 of them", n)
+	}
+	if after := txq.NumFreeFrames(); after != before+4 {
+		t.Errorf("pool has %d frames, want %d: a chain leaked", after, before+4)
+	}
+}
+
+// The combination Teraplane needs: a transmit-only device with small frames
+// and segmentation offload, sending a super-frame as a chain of those frames.
+// Before this, WithGSO forced 64 KB frames on every device, so a forwarder
+// whose bytes already sat in small buffers had to copy each one into a 64 KB
+// frame -- the copy multi-buffer exists to remove.
+func TestVethGSOChainOfSmallFrames(t *testing.T) {
+	needRoot(t)
+	name, peer := vethPair(t)
+
+	// Room for one packet larger than an ordinary MTU, so what is measured is
+	// the gather rather than the kernel's segmentation.
+	for _, n := range []string{name, peer} {
+		if out, err := exec.Command("ip", "link", "set", n, "mtu", "9000").CombinedOutput(); err != nil {
+			t.Skipf("cannot raise the MTU on %s: %v: %s", n, err, out)
+		}
+	}
+
+	// A receiving device still needs a frame that holds a whole super-frame.
+	rx, err := Open(name, WithTxQueues(0), WithRxQueues(1), WithGSO(), WithPromiscuous())
+	if err != nil {
+		t.Skipf("cannot open a GSO receiver here: %v", err)
+	}
+	defer rx.Close()
+
+	// The transmit device does not: 2 KB frames, chained.
+	const small = 2048
+	tx, err := Open(peer, WithTxQueues(1), WithRxQueues(0), WithGSO(),
+		WithFrameSize(small), WithFrames(256))
+	if err != nil {
+		t.Fatalf("a transmit-only GSO device with %d-byte frames was refused: %v", small, err)
+	}
+	defer tx.Close()
+	if got := tx.Region().FrameSize(); got != small {
+		t.Fatalf("frame size is %d, want the %d asked for: WithGSO overrode it", got, small)
+	}
+
+	// One TCP segment laid across several small frames, the shape a forwarder
+	// hands over: the packet is the concatenation and the metadata is the
+	// first descriptor's.
+	pkt, hdrLen, csumStart, csumOff := tcpSegment(4000)
+	want := onesComplement(pkt[csumStart:])
+	if want == 0 {
+		want = 0xffff
+	}
+	usable := tx.Capabilities().MaxFrameSize
+	var pieces [][]byte
+	for off := 0; off < len(pkt); off += usable {
+		pieces = append(pieces, pkt[off:min(off+usable, len(pkt))])
+	}
+	if len(pieces) < 3 {
+		t.Fatalf("the packet fits in %d frames; this test needs a real chain", len(pieces))
+	}
+
+	txq := tx.TxQueue(0).(packetio.OffloadTransmitter)
+	descs := txq.Alloc(len(pieces))
+	if len(descs) != len(pieces) {
+		t.Fatalf("allocated %d of %d frames", len(descs), len(pieces))
+	}
+	for i, p := range pieces {
+		copy(tx.Region().Writable(descs[i]), p)
+		descs[i].Len = uint32(len(p))
+		if i < len(pieces)-1 {
+			descs[i].Options |= packetio.OptContinued
+		}
+	}
+	offs := make([]packetio.Offload, len(pieces))
+	offs[0] = packetio.Offload{
+		Flags: packetio.OffloadNeedsCsum, HdrLen: uint16(hdrLen),
+		CsumStart: uint16(csumStart), CsumOff: uint16(csumOff),
+	}
+	n, err := txq.TransmitOffload(descs, offs)
+	if err != nil || n != len(descs) {
+		t.Fatalf("TransmitOffload took %d of %d: %v", n, len(descs), err)
+	}
+
+	rxq := rx.RxQueue(0).(packetio.OffloadReceiver)
+	rxq.Fill(rxq.NumFreeFillSlots())
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := rxq.Poll(200 * time.Millisecond); err != nil {
+			t.Fatalf("poll: %v", err)
+		}
+		ds, _ := rxq.ReceiveOffload(8)
+		for _, d := range ds {
+			f := rxq.Region().Frame(d)
+			if !ours(f) || len(f) < len(pkt) {
+				continue
+			}
+			// The chain must arrive as the one packet it was. Every byte but
+			// the checksum field, which the receiving device completes on the
+			// way in -- and which must come out as the real checksum, proving
+			// the gather put the payload together correctly: a sum over the
+			// wrong bytes would not match.
+			got := append([]byte(nil), f[:len(pkt)]...)
+			sum := uint16(got[csumStart+csumOff])<<8 | uint16(got[csumStart+csumOff+1])
+			copy(got[csumStart+csumOff:], pkt[csumStart+csumOff:csumStart+csumOff+2])
+			if !bytes.Equal(got, pkt) {
+				t.Errorf("the chained packet did not arrive as its concatenation")
+			}
+			if sum != want {
+				t.Errorf("checksum over the gathered packet is %#04x, want %#04x", sum, want)
+			}
+			rxq.Recycle(ds)
+			return
+		}
+		rxq.Recycle(ds)
+		rxq.Fill(rxq.NumFreeFillSlots())
+	}
+	t.Skip("nothing large enough arrived on the veth pair")
+}
+
+// The other half of parity: a packet larger than a frame is copied out of the
+// ring straight into several small frames, instead of into one large frame
+// that a forwarder then copies again into its own buffers. Receive and
+// transmit chains together mean a packet crosses this backend without ever
+// being made contiguous.
+func TestVethMultiBufferReceiveAndForward(t *testing.T) {
+	needRoot(t)
+	name, peer := vethPair(t)
+	for _, n := range []string{name, peer} {
+		if out, err := exec.Command("ip", "link", "set", n, "mtu", "9000").CombinedOutput(); err != nil {
+			t.Skipf("cannot raise the MTU on %s: %v: %s", n, err, out)
+		}
+	}
+
+	// Small frames, chaining on: the shape a forwarder wants.
+	const small = 2048
+	rx, err := Open(name, WithTxQueues(1), WithRxQueues(1), WithMultiBuffer(),
+		WithFrameSize(small), WithFrames(256), WithPromiscuous())
+	if err != nil {
+		t.Fatalf("open receiver: %v", err)
+	}
+	defer rx.Close()
+	if !rx.Capabilities().MultiBuffer {
+		t.Error("a device opened WithMultiBuffer does not report it")
+	}
+	tx, err := Open(peer, WithTxQueues(1), WithRxQueues(0), WithGSO(),
+		WithFrameSize(8192), WithFrames(256))
+	if err != nil {
+		t.Fatalf("open sender: %v", err)
+	}
+	defer tx.Close()
+
+	// One packet several frames long.
+	big := frame(7, 6000)
+	if _, err := tx.TxQueue(0).SendFunc(1, func(_ int, b []byte) int {
+		return copy(b, big)
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	rxq := rx.RxQueue(0)
+	rxq.Fill(rxq.NumFreeFillSlots())
+	var chain []packetio.Desc
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && len(chain) == 0 {
+		if _, err := rxq.Poll(200 * time.Millisecond); err != nil {
+			t.Fatalf("poll: %v", err)
+		}
+		ds := rxq.Receive(32)
+		for i, d := range ds {
+			f := rxq.Region().Frame(d)
+			if i == 0 && !ours(f) {
+				continue
+			}
+			chain = append(chain, ds[i:]...)
+			break
+		}
+		if len(chain) == 0 {
+			rxq.Recycle(ds)
+			rxq.Fill(rxq.NumFreeFillSlots())
+		}
+	}
+	if len(chain) == 0 {
+		t.Skip("nothing arrived on the veth pair")
+	}
+	if len(chain) < 3 {
+		t.Fatalf("a %d-byte packet came back in %d frames of %d", len(big), len(chain), small)
+	}
+
+	// Every frame but the last says the packet continues, and the pieces are
+	// what was sent.
+	var whole []byte
+	for i, d := range chain {
+		last := i == len(chain)-1
+		got := d.Options&packetio.OptContinued != 0
+		if got == last {
+			t.Errorf("frame %d of %d: continued=%v, want %v", i, len(chain), got, !last)
+		}
+		whole = append(whole, rxq.Region().Frame(d)...)
+		if last {
+			break
+		}
+	}
+	if !bytes.Equal(whole, big) {
+		t.Errorf("the chain concatenates to %d bytes, want the %d sent", len(whole), len(big))
+	}
+
+	// And it can be forwarded straight back out as the chain it is -- no
+	// copy anywhere in the path.
+	if n := rx.TxQueue(0).Transmit(chain); n != len(chain) {
+		t.Errorf("forwarding the received chain took %d of %d frames: %v",
+			n, len(chain), rx.TxQueue(0).Err())
+	}
+	rx.TxQueue(0).Complete(len(chain))
+}
+
+// The loan: a frame handed out by Receive is the caller's until Recycle, and
+// nothing the device does in between touches it. A forwarder that carries
+// received frames through a processing graph depends on this, and a violation
+// would not be an error -- it would be a packet quietly changing under it.
+func TestVethReceivedFramesAreUntouchedUntilRecycled(t *testing.T) {
+	needRoot(t)
+	name, peer := vethPair(t)
+
+	rx, err := Open(name, WithTxQueues(0), WithRxQueues(1), WithPromiscuous())
+	if err != nil {
+		t.Fatalf("open receiver: %v", err)
+	}
+	defer rx.Close()
+	tx, err := Open(peer, WithTxQueues(1), WithRxQueues(0))
+	if err != nil {
+		t.Fatalf("open sender: %v", err)
+	}
+	defer tx.Close()
+
+	send := func(seq byte, n int) {
+		if _, err := tx.TxQueue(0).SendFunc(1, func(_ int, b []byte) int {
+			return copy(b, frame(seq, n))
+		}); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+
+	q := rx.RxQueue(0)
+	q.Fill(q.NumFreeFillSlots())
+	region := q.Region()
+	base := region.Bytes()
+
+	// Take one packet and hold it.
+	send(1, 200)
+	var held packetio.Desc
+	var copyOfHeld []byte
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && copyOfHeld == nil {
+		q.Poll(200 * time.Millisecond)
+		for _, d := range q.Receive(8) {
+			if f := region.Frame(d); ours(f) {
+				held = d
+				copyOfHeld = append([]byte(nil), f...)
+				break
+			}
+		}
+		if copyOfHeld == nil {
+			q.Fill(q.NumFreeFillSlots())
+		}
+	}
+	if copyOfHeld == nil {
+		t.Skip("nothing arrived on the veth pair")
+	}
+
+	// Now drive the queue hard while holding it: more traffic, more Receive
+	// calls, more Fill. None of it may reach the loaned frame.
+	for round := 0; round < 8; round++ {
+		send(byte(2+round), 300)
+		q.Fill(q.NumFreeFillSlots())
+		q.Poll(100 * time.Millisecond)
+		ds := q.Receive(16)
+		for _, d := range ds {
+			if d.Addr == held.Addr {
+				t.Fatalf("round %d: the loaned frame at %d was handed out again", round, d.Addr)
+			}
+		}
+		q.Recycle(ds)
+		q.Fill(q.NumFreeFillSlots())
+	}
+
+	if got := region.Frame(held); !bytes.Equal(got, copyOfHeld) {
+		t.Errorf("the loaned frame changed while it was held: %d bytes now, %d then",
+			len(got), len(copyOfHeld))
+	}
+	// The mapping itself must be the same memory throughout.
+	if now := region.Bytes(); &now[0] != &base[0] || len(now) != len(base) {
+		t.Error("Region().Bytes() moved while the device was open")
+	}
+	q.Recycle([]packetio.Desc{held})
+}
+
+// A packet sent straight out of the caller's own memory, never copied into a
+// frame. This is the affordance a forwarder needs: its packet already sits in
+// its own buffers, and moving it into the region first would copy every byte
+// to protect against a device that, here, reads nothing after the call.
+func TestVethTransmitGather(t *testing.T) {
+	needRoot(t)
+	name, peer := vethPair(t)
+
+	rx, err := Open(name, WithTxQueues(0), WithRxQueues(1), WithPromiscuous())
+	if err != nil {
+		t.Fatalf("open receiver: %v", err)
+	}
+	defer rx.Close()
+	tx, err := Open(peer, WithTxQueues(1), WithRxQueues(0))
+	if err != nil {
+		t.Fatalf("open sender: %v", err)
+	}
+	defer tx.Close()
+	if !tx.Capabilities().GatherTx {
+		t.Fatal("afpacket does not report GatherTx")
+	}
+	g, ok := tx.TxQueue(0).(packetio.GatherTransmitter)
+	if !ok {
+		t.Fatal("the transmit queue is not a GatherTransmitter")
+	}
+
+	// Two packets in ordinary Go memory, one of them in four pieces. Nothing
+	// here came from the queue's pool.
+	one := frame(1, 400)
+	two := frame(2, 150)
+	segs := [][]byte{one[:90], one[90:200], one[200:310], one[310:], two}
+	counts := []int{4, 1}
+
+	before := tx.TxQueue(0).NumFreeFrames()
+	n, err := g.TransmitGather(segs, counts, nil)
+	if err != nil || n != 2 {
+		t.Fatalf("TransmitGather sent %d of 2: %v", n, err)
+	}
+	// Nothing was taken from the pool and nothing is waiting to come back.
+	if after := tx.TxQueue(0).NumFreeFrames(); after != before {
+		t.Errorf("pool went from %d to %d frames: gather took frames it should not have",
+			before, after)
+	}
+	if got := tx.TxQueue(0).NumInFlight(); got != 0 {
+		t.Errorf("%d frames in flight after a gather; nothing should be pending", got)
+	}
+
+	rxq := rx.RxQueue(0)
+	rxq.Fill(rxq.NumFreeFillSlots())
+	var got [][]byte
+	deadline := time.Now().Add(3 * time.Second)
+	for len(got) < 2 && time.Now().Before(deadline) {
+		if _, err := rxq.Poll(200 * time.Millisecond); err != nil {
+			t.Fatalf("poll: %v", err)
+		}
+		ds := rxq.Receive(8)
+		for _, d := range ds {
+			if f := rxq.Region().Frame(d); ours(f) {
+				got = append(got, append([]byte(nil), f...))
+			}
+		}
+		rxq.Recycle(ds)
+		rxq.Fill(rxq.NumFreeFillSlots())
+	}
+	if len(got) < 2 {
+		t.Fatalf("received %d packets, want 2", len(got))
+	}
+	if !bytes.Equal(got[0], one) {
+		t.Errorf("the gathered packet arrived as %d bytes, want the %d-byte whole",
+			len(got[0]), len(one))
+	}
+	if !bytes.Equal(got[1], two) {
+		t.Error("the single-segment packet did not survive the gather before it")
+	}
+}
+
+// A chained send re-aims each message at chainIovs, where a packet has as many
+// iovecs as pieces. The single-frame path does not set those pointers -- it
+// fills fixed iovecs wired once at construction -- so unless the wiring is put
+// back, the next plain send fills q.iovs while the kernel reads chainIovs and
+// puts the PREVIOUS packet on the wire again. After a gather it is worse: the
+// stale iovecs aim into memory the caller has taken back.
+//
+// The mixed-batch test does not catch this, because its plain packet rides the
+// same call and so goes down the chained path too. It takes a later,
+// chain-free call.
+func TestPlainSendAfterChainedSend(t *testing.T) {
+	needRoot(t)
+	name, peer := vethPair(t)
+
+	rx, err := Open(name, WithTxQueues(0), WithRxQueues(1), WithPromiscuous())
+	if err != nil {
+		t.Fatalf("open receiver: %v", err)
+	}
+	defer rx.Close()
+	tx, err := Open(peer, WithTxQueues(1), WithRxQueues(0))
+	if err != nil {
+		t.Fatalf("open sender: %v", err)
+	}
+	defer tx.Close()
+	txq := tx.TxQueue(0)
+
+	// 1: a chain.
+	whole := frame(1, 300)
+	d := txq.Alloc(3)
+	for i, p := range [][]byte{whole[:100], whole[100:200], whole[200:]} {
+		copy(tx.Region().Writable(d[i]), p)
+		d[i].Len = uint32(len(p))
+		if i < 2 {
+			d[i].Options |= packetio.OptContinued
+		}
+	}
+	txq.Transmit(d)
+	txq.Complete(8)
+
+	// 2: a SEPARATE, later, chain-free call.
+	plain := frame(9, 250)
+	d2 := txq.Alloc(1)
+	copy(tx.Region().Writable(d2[0]), plain)
+	d2[0].Len = uint32(len(plain))
+	if n := txq.Transmit(d2); n != 1 {
+		t.Fatalf("plain transmit after a chain took %d: %v", n, txq.Err())
+	}
+
+	rxq := rx.RxQueue(0)
+	rxq.Fill(rxq.NumFreeFillSlots())
+	var got [][]byte
+	deadline := time.Now().Add(3 * time.Second)
+	for len(got) < 2 && time.Now().Before(deadline) {
+		rxq.Poll(200 * time.Millisecond)
+		ds := rxq.Receive(8)
+		for _, dd := range ds {
+			if f := rxq.Region().Frame(dd); ours(f) {
+				got = append(got, append([]byte(nil), f...))
+			}
+		}
+		rxq.Recycle(ds)
+		rxq.Fill(rxq.NumFreeFillSlots())
+	}
+	if len(got) < 2 {
+		t.Fatalf("received %d packets, want 2", len(got))
+	}
+	if !bytes.Equal(got[1], plain) {
+		t.Errorf("the plain packet after a chain arrived as %d bytes, want %d: the "+
+			"message wiring was left pointing at the chain's iovecs",
+			len(got[1]), len(plain))
+	}
+}

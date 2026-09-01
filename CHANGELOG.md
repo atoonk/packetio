@@ -276,3 +276,141 @@ for memory safety and cost nothing: a frame outside the pool, an address that is
 not a frame start, a push past capacity. The guard that stops a bad descriptor
 reaching the card is in the mlx5 backend and is never compiled out. See
 `internal/pool/check_off.go` for the measurement behind that split.
+
+**afpacket: a super-frame's checksum is left alone.** Reported by a forwarder
+integrating this backend. The receive path finished any partial checksum it
+was handed, keyed only on NEEDS_CSUM, so a GRO'd TCP super-frame -- which
+carries NEEDS_CSUM *and* a GSO type -- had its pseudo-header partial replaced
+by a sum over the whole 64 KB. That partial is what the segmenter computes
+each segment's checksum from, so every segment then went out with a checksum
+for bytes it did not contain: the far end dropped all of them and no counter
+moved. Completion now skips segmented frames, which is what the kernel's own
+transmit path does and for the same reason.
+
+Two more of the same family, found while confirming it. A frame that IS
+completed now has NEEDS_CSUM cleared -- the flag means somebody downstream
+must finish the sum, and after completion nobody does, so a forwarder passing
+the metadata back to the kernel had it completed a second time over a field
+holding the finished sum. And the VLAN reinsertion shifted hdr_len only when
+NEEDS_CSUM was set, though the kernel accepts a segmented frame without it
+(virtio_net_hdr_to_skb dissects the flow to find the transport header
+instead); the two offsets now move independently.
+
+The reported mechanism in the length bound was slightly different in
+practice, and worse. The bound stops the sum at the end of the IP payload so
+that a short frame's Ethernet padding is not summed, and it was believed
+whatever it said. A length field that stops short of the frame does not
+always mean padding: above 65535 the kernel writes the low bits of a number
+that does not fit, and a sender can simply put a small number there. Either
+way the range can end before the checksum field it is completing, so the
+partial is never counted and the answer is confidently wrong -- and the frame
+is then marked complete, so nothing downstream can tell. Measured at 50 bytes
+summed out of a 65,620-byte frame, and at a 60-byte frame whose checksum came
+out 0x3937 instead of 0x24fc. The field is now believed only where it could
+be telling the truth: it must leave the checksum field inside the range, and
+it may stop short of the frame only by as much as padding to the Ethernet
+minimum would explain.
+
+And one found while confirming the above, which nobody had reported: the bound
+that stops the sum at the end of the IP payload looked for the packet type at
+byte 12, where a tagged frame has the tag the kernel stripped and this backend
+put back. The type was found on no tagged frame, the bound turned itself off,
+and the Ethernet padding of every short tagged frame went into its checksum.
+It hid because a ones-complement sum cannot see padding of zeroes or of all
+ones, which is most padding; only a sender leaving other bytes behind shows it.
+The type is now found by stepping over the tags, single or stacked.
+
+**afpacket: a packet may now be several frames.** A forwarder that carries a
+coalesced super-frame as a chain of pool buffers had to copy it into one
+contiguous frame to transmit it, because this backend took one frame per
+packet. Measured by the forwarder that hit it: 14.4 -> 12.2 Gbit/s and 48% ->
+79% of a core on segmentation-offloaded TCP, all of it two 64 KB copies per
+super-frame -- an arithmetic prediction of 30 points of a core against 31
+measured.
+
+Transmit now takes a packet as several descriptors, each but the last marked
+`OptContinued`, and builds one message with an iovec per frame, so the kernel
+gathers straight out of the region. The mechanism was already there: sendmmsg
+takes a scatter list and GSO mode was already using two iovecs for the virtio
+header and the frame.
+
+The contract, which the other backends will follow when they gain this:
+metadata belongs to the packet rather than to a frame of it, so an `Offload`
+rides the first descriptor, the continuations carry none, and it is validated
+against the packet's whole length -- with 2 KB frames every real super-frame's
+csum_start is past the first one. `Transmit`'s prefix is now a prefix of whole
+packets as well as of frames, because half a packet is not a shorter packet.
+A chain that runs off the end of a batch is refused rather than half-sent.
+
+And `WithGSO` no longer forces 64 KB frames on every device. That size is a
+RECEIVE requirement -- a super-frame arrives whole and has to land in one
+frame -- and applying it to transmit made the feature above worth nothing to
+the caller who asked for it: their bytes already sat in 2 KB buffers, so
+chaining into 64 KB frames meant copying every one of them first, which is
+the copy being removed. A transmit-only device may now use any frame size and
+chain, and a receiving one still needs the room. Sizing is settled once all
+the options have run rather than inside `WithGSO`'s own closure, so neither
+the frame size nor the frame count depends on the order the options were
+listed in.
+
+`Capabilities.MultiBuffer` follows `WithMultiBuffer`, which is what turns the
+receive half on. The single-frame path is untouched and
+measured unchanged (0.42 Mpps either side); a queue that never sends a chain
+allocates none of the scratch.
+
+**afpacket: a received packet may span several frames.** `WithMultiBuffer`
+lays a packet too big for one frame across as many as it takes, marking every
+one but the last `OptContinued`, instead of counting it oversize and dropping
+it. With the transmit side above, a packet now crosses this backend without
+ever being made contiguous: the ring is copied straight into the caller's
+buffers and those same buffers become the iovecs on the way out.
+
+The measurement that asked for it is worth recording for its own sake. It was
+first reported as worth nothing -- 0.5% -- and the retraction was wrong: that
+run had CPU to spare, and a copy costs nothing while a core is idle. Saturated,
+the same path was 28% down, in one symbol: runtime.memmove at 845k cycles per
+Mbit against a native path's 278k, three copies against one. Any measurement of
+a change that removes copying has to run the machine out of headroom, or it
+measures the wrong thing and says so confidently.
+
+Off by default, and free when off: a caller that does not ask keeps the old
+behaviour, the ring never takes the branch, and receive measured 0.38 Mpps
+either side of the change.
+
+A packet is handed over whole or not at all, never in pieces, and which of
+those happens depends on what ran out. Frames momentarily gone, or a full
+batch, leaves the packet in the ring for the next call. A packet needing more
+slots than the caller's whole `max` is dropped and counted instead: no call of
+that size could ever take it, and retrying it forever would stop the queue.
+So a receiving caller sizes its batch for its traffic -- at least
+`ceil(largest packet / MaxFrameSize)`, which is 33 for 64 KB super-frames over
+2 KB frames -- and `Backend["batch_too_small"]` reports the drops a bigger
+batch would have prevented, separately from genuine oversize.
+
+**afpacket: send from your own memory.** `TransmitGather` takes a packet as
+slices the caller owns, gathers them into one message, and returns -- no frame
+from the pool, nothing pending, nothing to reclaim. It can exist because
+AF_PACKET transmit is synchronous: the kernel copies into an skb before
+sendmmsg returns, so there is no window in which anything reads the caller's
+bytes. Copying them into the region first would protect against a device
+reading them later, and here none does, which makes it a copy of every byte
+for nothing.
+
+That copy was a third of the excess a forwarder measured against its native
+backend on offloaded traffic. `Capabilities.GatherTx` reports it, and it is
+false everywhere a NIC does its own fetching: there the memory must be
+registered with the device first, which is what a Region is. This is the one
+optional interface that steps outside the frame-ownership model, and it does
+so only because there is no ownership to hand over.
+
+Also: `WithGSO` with receive queues and small frames is no longer refused when
+`WithMultiBuffer` is set. A super-frame needs somewhere whole to go, and a
+chain of small frames is somewhere -- refusing it refused the one
+configuration receive chains exist for.
+
+And the loan a receive queue makes is now written down rather than implied: a
+frame handed out by `Receive` is the caller's until `Recycle`, no later
+`Receive` or `Fill` touches it, and `Region.Bytes` is one mapping for the life
+of the device. A forwarder carrying received frames through its own graph
+depends on that, and a backend breaking it would not produce an error -- it
+would produce a packet that changed while somebody was reading it.

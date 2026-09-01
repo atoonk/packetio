@@ -136,10 +136,21 @@ type ring struct {
 	// frame-sized packet, which is a wrong packet count and a wrong byte count
 	// with nothing saying so.
 	oversize atomic.Uint64
-	packets  atomic.Uint64
+
+	// batchTooSmall counts the subset of oversize whose cause is the caller's
+	// batch rather than its frames: a chained packet needing more slots than
+	// max. It is the one drop here the caller can fix without reconfiguring
+	// the device, so it is worth being able to see on its own.
+	batchTooSmall atomic.Uint64
+	packets       atomic.Uint64
 
 	// vnet is set when the kernel prefixes every frame with a virtio-net
 	// header, which is what carries the segmentation and checksum metadata.
+	// chain is true when a packet too big for one buffer is laid across
+	// several instead of being dropped. Off by default: a caller that does
+	// not expect OptContinued would see a fragment as a whole packet.
+	chain bool
+
 	vnet bool
 }
 
@@ -148,7 +159,7 @@ type ring struct {
 // arrives whole instead of being dropped or truncated. PACKET_VNET_HDR itself
 // is set by the caller, before this, because a transmit-only socket needs it
 // too and has no ring.
-func setupRing(fd int, vnet bool) (*ring, error) {
+func setupRing(fd int, vnet, chain bool) (*ring, error) {
 	if err := unix.SetsockoptInt(fd, unix.SOL_PACKET, packetVersion, tpacketV3); err != nil {
 		return nil, fmt.Errorf("PACKET_VERSION v3: %w", err)
 	}
@@ -186,7 +197,7 @@ func setupRing(fd int, vnet bool) (*ring, error) {
 			return nil, fmt.Errorf("mmap rx ring (%d bytes): %w", size, err)
 		}
 	}
-	return &ring{fd: fd, mem: mem, blockSize: req.blockSize, blockNr: req.blockNr, vnet: vnet}, nil
+	return &ring{fd: fd, mem: mem, blockSize: req.blockSize, blockNr: req.blockNr, vnet: vnet, chain: chain}, nil
 }
 
 // teardownRing unconfigures a ring by requesting a zero-sized one, which is the
@@ -279,7 +290,13 @@ func (r *ring) advance(next uint32) {
 // called more than once with the same i, because a frame that does not fit the
 // buffer is skipped without producing output, and the caller is expected to
 // hand back the same buffer rather than a fresh one.
-func (r *ring) read(max int, dst func(i int) []byte, lens []int, offs []packetio.Offload, tss []uint64) int {
+// When the ring is chaining, a packet too big for one buffer is split across
+// several output slots instead of being dropped: cont[i] is then true for
+// every slot but the last of a packet, which is what the caller turns into
+// OptContinued. A packet that cannot be finished -- slots or frames ran out --
+// produces nothing and is left in the ring for the next call, because half a
+// packet is not a shorter packet.
+func (r *ring) read(max int, dst func(i int) []byte, lens []int, offs []packetio.Offload, tss []uint64, cont []bool) int {
 	out := 0
 	// Drain consecutive ready blocks until max is met or the ring runs dry.
 	// Each block goes back to the kernel the moment it is empty -- holding a
@@ -330,10 +347,56 @@ blocks:
 				tagLen = 4
 			}
 			if plen+tagLen > len(buf) {
-				// Does not fit: count it and skip it. Delivering a clamped length
-				// instead would make an oversized frame look like a frame-sized
-				// packet, with nothing saying otherwise.
-				r.oversize.Add(1)
+				if !r.chain {
+					// Does not fit: count it and skip it. Delivering a clamped length
+					// instead would make an oversized frame look like a frame-sized
+					// packet, with nothing saying otherwise.
+					r.oversize.Add(1)
+					r.advance(next)
+					continue
+				}
+				// Chaining: lay the packet across as many slots as it takes.
+				// The whole packet or none of it -- a caller handed half of
+				// one has no way to know that is what it is.
+				n, ok, noSlots := r.spread(out, max, d, plen, tagLen, tpid, tci, dst, lens, cont)
+				if !ok {
+					if noSlots && out == 0 {
+						// The caller's whole batch is too small for this
+						// packet, so no call of this size will ever take it
+						// and waiting would stop the queue for good. Count it
+						// and step over it, which is what a packet too big for
+						// one frame gets when chaining is off.
+						r.oversize.Add(1)
+						r.batchTooSmall.Add(1)
+						r.advance(next)
+						continue
+					}
+					// Room ran out with work already done, or frames did.
+					// Either will be there next time; leave the packet where
+					// it is.
+					r.pending = true
+					break blocks
+				}
+				if offs != nil {
+					// Metadata describes the packet, so it rides its first
+					// slot; the rest carry none. They must be cleared rather
+					// than left, because this scratch is reused and a stale
+					// NeedsCsum on a continuation would have the completion
+					// pass write two bytes into the middle of a packet.
+					offs[out] = r.offloadFor(d, tagLen)
+					for i := out + 1; i < out+n; i++ {
+						offs[i] = packetio.Offload{}
+					}
+				}
+				if tss != nil {
+					// Likewise the arrival time: one packet, one stamp, on the
+					// slot that starts it.
+					tss[out] = uint64(tph.tpSec)*1e9 + uint64(tph.tpNsec)
+					for i := out + 1; i < out+n; i++ {
+						tss[i] = 0
+					}
+				}
+				out += n
 				r.advance(next)
 				continue
 			}
@@ -347,19 +410,7 @@ blocks:
 			}
 			lens[out] = plen + tagLen
 			if offs != nil {
-				var o packetio.Offload
-				if r.vnet {
-					o = packetio.UnmarshalOffload(r.mem[d-packetio.OffloadHdrLen : d])
-					// csum_start is measured from the start of the frame, so it
-					// moves with a tag put back in front of it.
-					if tagLen != 0 && o.Flags&packetio.OffloadNeedsCsum != 0 {
-						o.CsumStart += uint16(tagLen)
-						if o.HdrLen != 0 {
-							o.HdrLen += uint16(tagLen)
-						}
-					}
-				}
-				offs[out] = o
+				offs[out] = r.offloadFor(d, tagLen)
 			}
 			if tss != nil {
 				// The kernel stamps every frame as it puts it in the ring,
@@ -381,4 +432,108 @@ blocks:
 	}
 	r.packets.Add(uint64(out))
 	return out
+}
+
+// offloadFor reads the virtio header the kernel put in front of the frame at
+// d, with the offsets moved by a tag put back in front of the packet.
+//
+// Both offsets are measured from the start of the frame, so both move with the
+// tag. They move independently: the kernel accepts a segmented frame with no
+// partial checksum (it finds the transport header by dissecting the flow
+// instead), and such a frame has a header length to shift and no csum_start.
+//
+// Saturating, not wrapping. These are kernel-written and bounds-checked
+// downstream rather than trusted, and a value near the top of the field would
+// wrap to a small one -- turning an offset the checker would have refused into
+// one it accepts, which writes over a header and then reports the frame as
+// complete.
+func (r *ring) offloadFor(d uint32, tagLen int) packetio.Offload {
+	var o packetio.Offload
+	if !r.vnet {
+		return o
+	}
+	o = packetio.UnmarshalOffload(r.mem[d-packetio.OffloadHdrLen : d])
+	if tagLen == 0 {
+		return o
+	}
+	shift := func(v uint16) uint16 {
+		if int(v)+tagLen > 0xffff {
+			return 0xffff
+		}
+		return v + uint16(tagLen)
+	}
+	if o.Flags&packetio.OffloadNeedsCsum != 0 {
+		o.CsumStart = shift(o.CsumStart)
+	}
+	if o.HdrLen != 0 {
+		o.HdrLen = shift(o.HdrLen)
+	}
+	return o
+}
+
+// spread lays one packet across several output slots, starting at out, and
+// reports how many it used. It reports false when the packet does not fit in
+// the slots or the frames available, having written nothing the caller will
+// use: a packet is delivered whole or not at all, because a caller handed the
+// first half of one cannot tell that is what it has.
+//
+// The packet is the frame with its VLAN tag put back, which is why the copy
+// walks segments rather than one range: the tag sits between byte 12 and the
+// rest, and a chain boundary can fall anywhere, including inside the tag.
+// It reports noSlots when what ran out was output slots rather than frames.
+// The difference decides what the caller does next: a batch with no room left
+// will have room next time, but a packet needing more slots than the caller's
+// whole batch will never fit one, and retrying it forever would stop the queue.
+func (r *ring) spread(out, max int, d uint32, plen, tagLen int, tpid, tci uint16,
+	dst func(i int) []byte, lens []int, cont []bool) (n int, ok, noSlots bool) {
+
+	var tag [4]byte
+	var segs [3][]byte
+	nsegs := 0
+	if tagLen != 0 {
+		tag[0], tag[1] = byte(tpid>>8), byte(tpid)
+		tag[2], tag[3] = byte(tci>>8), byte(tci)
+		segs[0] = r.mem[d : d+12]
+		segs[1] = tag[:]
+		segs[2] = r.mem[d+12 : d+uint32(plen)]
+		nsegs = 3
+	} else {
+		segs[0] = r.mem[d : d+uint32(plen)]
+		nsegs = 1
+	}
+
+	seg, at := 0, 0
+	for seg < nsegs {
+		if out+n >= max {
+			return 0, false, true
+		}
+		buf := dst(out + n)
+		if buf == nil {
+			return 0, false, false
+		}
+		room := len(buf)
+		written := 0
+		for seg < nsegs && written < room {
+			c := copy(buf[written:], segs[seg][at:])
+			written += c
+			at += c
+			if at == len(segs[seg]) {
+				seg, at = seg+1, 0
+			}
+		}
+		lens[out+n] = written
+		n++
+	}
+	// Only now, with the whole packet placed, are the slots marked. Marking
+	// as they were filled left the marks behind on the failure returns above,
+	// and the next packet delivered into one of those slots -- by the
+	// single-frame path, which writes lens and offs but not cont -- arrived
+	// claiming to continue into a packet that was never delivered.
+	if cont != nil {
+		for i := out; i < out+n-1; i++ {
+			cont[i] = true
+		}
+		cont[out+n-1] = false
+	}
+	return n, true, false
 }

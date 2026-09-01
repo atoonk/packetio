@@ -23,6 +23,16 @@ jobs:
       - name: cross-build
         run: GOOS=darwin GOARCH=arm64 go build ./...
 
+      # The darwin build above compiles none of the backends: they are all
+      # //go:build linux, so a mistake inside one is invisible to it. These
+      # do compile them, and they catch the kind that only shows on a
+      # 32-bit machine -- a syscall struct field that is uint32 there and
+      # uint64 here, which builds clean on the machine you wrote it on.
+      - name: cross-build the backends for 32-bit Linux
+        run: |
+          GOOS=linux GOARCH=386 go build ./...
+          GOOS=linux GOARCH=arm go build ./...
+
       - name: vet
         run: go vet ./...
 

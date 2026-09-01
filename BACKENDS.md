@@ -77,6 +77,16 @@ it, so a short return with a free ring points at the offending descriptor. It
 must never pass a bad address to the kernel or the card, and must never return
 one to the pool.
 
+**A received frame is on loan until Recycle.** Between `Receive` handing a
+descriptor out and `Recycle` taking it back, the frame it names belongs to the
+caller alone: no later `Receive`, no `Fill`, nothing the backend does may write
+to it, hand it out again, or move it. `Region.Bytes` is one mapping for the
+life of the device, so an address stays an address. This is what lets a
+forwarder carry received frames through whatever it does next instead of
+copying them out first, and it is the reason `Fill` draws only on frames the
+pool holds. Breaking it does not produce an error anywhere: it produces a
+packet that changes while somebody is reading it.
+
 **Region.Frame and Region.Writable return nil** for a descriptor that is not
 inside the region. They do not panic. Code written against one backend has to
 work against another.
@@ -186,6 +196,37 @@ unconditionally - `afpacket` and `dpdk` do - but a call the device cannot
 honour must fail loudly with `ErrUnsupported`, never succeed doing nothing: an
 assertion that lands in a method quietly returning zero values is worse than
 no interface at all, because nothing downstream can tell.
+
+**A packet may be more than one frame,** in both directions. Where a backend
+can hand the hardware a scatter list, a caller may give one packet as several
+descriptors, each but the last carrying `OptContinued`; and where a backend can
+fill several frames from one arriving packet, it may deliver one the same way.
+Receiving in chains is opt-in, because a caller that does not read
+`OptContinued` would take the first frame of a packet for a whole one. A packet
+is delivered whole or not at all, so one that will not fit the frames available
+is left where it is rather than delivered in part. The exception is a packet
+needing more slots than the caller's whole batch: no call of that size will ever
+take it, and leaving it would stop the queue, so it is counted oversize and
+dropped. A receiving caller therefore sizes its batch for the traffic, at least
+`ceil(largest packet / MaxFrameSize)`.
+
+Two rules follow. The metadata belongs to the packet, not to a frame of it, so
+an `Offload` rides the first descriptor and the continuations carry none, and a
+partial checksum on a chain is left for the caller to finish once the packet is
+whole; and `Transmit`'s prefix is a prefix of packets as well as of frames,
+because half a packet is not a shorter packet, it is a fragment nothing
+downstream can use. `Capabilities.MultiBuffer` means both directions, and a
+backend sets it when it can do both -- `afpacket` does under `WithMultiBuffer`.
+
+`GatherTransmitter` is the one optional interface that steps outside the frame
+ownership model, and it can only exist where there is no ownership to hand
+over. AF_PACKET transmit is synchronous -- the kernel copies into an skb before
+`sendmmsg` returns -- so a packet may be sent straight out of the caller's
+memory, nothing is taken from a pool, nothing pends, and nothing is reclaimed.
+Any device that reads the bytes by DMA after the call cannot offer this at any
+price: its memory must be registered with the device first, which is what a
+Region is. `Capabilities.GatherTx` says which kind a backend is, and it is
+false everywhere a NIC does its own fetching.
 
 `TimestampReceiver` follows the same shape and one extra rule, because a
 timestamp has no defensible zero: an offload of all zeroes means "an ordinary

@@ -400,6 +400,13 @@ eight, both inside run-to-run noise.
 **The slices belong to the queue.** `descs` and `ts` are overwritten by the
 next receive call. Copy anything you mean to keep.
 
+**On a link with offloads on, one timestamp can cover many packets.** The
+kernel coalesces received segments into one super-frame (GRO) and stamps that,
+at the moment it coalesced rather than when each segment arrived. A stream that
+would have been forty-odd samples becomes one, with a skew nobody sees in the
+numbers. Turn offloads off on the link you are measuring, or measure something
+that is not being coalesced.
+
 **Arrival order is not delivery order.** A card stamps at the port and places
 the packet in a queue afterwards, so while it is dropping traffic the two come
 apart: at rates it keeps up with, stamps rise packet by packet (2 out of 9.1
@@ -451,6 +458,25 @@ if r, ok := rq.(packetio.OffloadReceiver); ok {
         descs, offs := r.ReceiveOffload(64)
 }
 ```
+
+A 64 KB packet does not need a 64 KB frame. Where `Capabilities().MultiBuffer`
+says so, one packet may lie across several descriptors, each but the last
+marked `OptContinued` - the AF_XDP convention. It goes both ways: hand
+`Transmit` a chain and the device gathers it, and on receive you get the same
+shape back. That lets a forwarder keep small frames and still carry
+segmentation-offloaded traffic, instead of sizing every frame for the largest
+packet it will ever see.
+
+```go
+for _, d := range rq.Receive(64) {
+        if d.Options&packetio.OptContinued != 0 {
+                // more of this packet follows
+        }
+}
+```
+
+If your packets already live in your own memory, `GatherTransmitter` skips the
+region entirely and sends from your slices.
 
 ## What is here
 

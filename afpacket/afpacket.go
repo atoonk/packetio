@@ -72,6 +72,7 @@ func Open(iface string, opts ...Option) (d *Device, err error) {
 	for _, o := range opts {
 		o(&cfg)
 	}
+	cfg.resolve()
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -211,7 +212,7 @@ func (d *Device) openSocket(index int, wantRing, fanout bool, group uint16) (int
 		// never releases a block -- the reader then waits forever on a socket
 		// whose drop counter is climbing.
 		var err error
-		if r, err = setupRing(fd, d.cfg.gso); err != nil {
+		if r, err = setupRing(fd, d.cfg.gso, d.cfg.multiBuffer); err != nil {
 			unix.Close(fd)
 			return -1, nil, fmt.Errorf("afpacket: receive ring on %s: %w", d.iface, err)
 		}
@@ -251,12 +252,15 @@ func (d *Device) Capabilities() packetio.Capabilities {
 		// A packet socket only ever takes copies; the kernel's own path is
 		// untouched by definition.
 		KernelCoexistence: true,
-		MultiBuffer:       false,
-		RSS:               len(d.rx) > 1,
-		BlockingPoll:      true,
-		SharedRegion:      true,
-		HandsBackFrames:   true,
-		Offload:           d.cfg.gso,
+		MultiBuffer:       d.cfg.multiBuffer,
+		// The kernel copies into an skb before sendmmsg returns, so a packet
+		// can be sent from anywhere and nothing reads it afterwards.
+		GatherTx:        true,
+		RSS:             len(d.rx) > 1,
+		BlockingPoll:    true,
+		SharedRegion:    true,
+		HandsBackFrames: true,
+		Offload:         d.cfg.gso,
 		// The kernel stamps every frame into the ring whether or not anyone
 		// reads it, so this needs no option and is never false here.
 		RxTimestamps: true,

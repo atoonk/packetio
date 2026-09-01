@@ -43,6 +43,7 @@ type RxQueue struct {
 	ringMu sync.Mutex
 
 	lens  []int
+	cont  []bool
 	descs []packetio.Desc
 	offs  []packetio.Offload
 	tss   []uint64
@@ -193,6 +194,21 @@ func (q *RxQueue) ready() int {
 
 // Receive copies up to max packets out of the ring into free frames and returns
 // descriptors naming them. The returned slice is reused by the next call.
+//
+// With [WithMultiBuffer] a packet larger than one frame is laid across several,
+// every one but the last carrying [packetio.OptContinued]; without it such a
+// packet is counted oversize and dropped.
+//
+// Either way a packet is delivered whole or not at all: half a packet is not a
+// shorter packet, it is a fragment the caller cannot recognise as one. What
+// happens to a packet that will not fit depends on which room ran out. If the
+// frames are momentarily gone, or this batch is simply full, it stays in the
+// ring and arrives next call. If it needs more slots than max, no call of this
+// size can ever take it, so it is counted oversize and dropped rather than
+// retried forever -- waiting would stop the queue for good. Size the batch for
+// the traffic: a packet of n bytes needs ceil(n/[Device.MaxFrameSize]) slots,
+// so a forwarder carrying 64 KB super-frames over 2 KB frames wants max of at
+// least 33.
 func (q *RxQueue) Receive(max int) []packetio.Desc {
 	d, _ := q.receive(max, false)
 	return d
@@ -201,6 +217,17 @@ func (q *RxQueue) Receive(max int) []packetio.Desc {
 // ReceiveOffload is Receive, and also returns the segmentation and checksum
 // metadata the kernel reported for each frame. Without [WithGSO] every Offload
 // is the zero value, which means an ordinary frame.
+//
+// An ordinary frame delivered with only a partial checksum is finished here,
+// and its OffloadNeedsCsum is cleared, because after that nobody downstream
+// has to finish anything. A super-frame is left alone: its partial is what the
+// segmenter works from, so the flag stays set and the frame keeps its partial
+// all the way to whoever cuts it up. A packet spread across several frames by
+// [WithMultiBuffer] is likewise left alone, because no one frame holds all the
+// bytes the sum covers: its OffloadNeedsCsum stays set on the first descriptor
+// and finishing it is the caller's job, after the chain is back together. A
+// frame whose offsets did not fit is delivered untouched with the flag still
+// set, and counted in Stats().Backend["bad_checksum"].
 //
 // It implements [packetio.OffloadReceiver].
 func (q *RxQueue) ReceiveOffload(max int) ([]packetio.Desc, []packetio.Offload) {
@@ -246,6 +273,18 @@ func (q *RxQueue) receive(max int, wantTimestamps bool) ([]packetio.Desc, []pack
 	if cap(q.offs) < max {
 		q.offs = make([]packetio.Offload, max)
 	}
+	// Only a chaining ring reports which slots continue into the next; a
+	// caller that never sees a chain never pays for the slice.
+	var cont []bool
+	if q.ring.chain {
+		if cap(q.cont) < max {
+			q.cont = make([]bool, max)
+		}
+		cont = q.cont[:max]
+		for i := range cont {
+			cont[i] = false
+		}
+	}
 	// Only a caller that asked pays for the walk to fill this; the ring skips
 	// the read entirely when it is nil.
 	var tss []uint64
@@ -271,7 +310,7 @@ func (q *RxQueue) receive(max int, wantTimestamps bool) ([]packetio.Desc, []pack
 		}
 		q.descs = append(q.descs, packetio.Desc{Addr: q.addrs[0] + frameHeadroom})
 		return q.region.Writable(q.descs[i])
-	}, q.lens[:max], q.offs[:max], tss)
+	}, q.lens[:max], q.offs[:max], tss, cont)
 
 	// A frame may have been taken for a slot that produced nothing, when the
 	// walk ended on an oversized frame. Give those back -- by frame start,
@@ -286,6 +325,11 @@ func (q *RxQueue) receive(max int, wantTimestamps bool) ([]packetio.Desc, []pack
 	var bytes uint64
 	for i := range q.descs {
 		q.descs[i].Len = uint32(q.lens[i])
+		if cont != nil && cont[i] {
+			// This frame is one piece of a larger packet; the piece after it
+			// carries the rest.
+			q.descs[i].Options |= packetio.OptContinued
+		}
 		bytes += uint64(q.lens[i])
 	}
 	if got > 0 {
@@ -296,26 +340,24 @@ func (q *RxQueue) receive(max int, wantTimestamps bool) ([]packetio.Desc, []pack
 	if got == 0 && q.pool.Len() == 0 {
 		q.empty.Add(1)
 	}
-	// A frame the kernel says carries a partial checksum has only the
-	// pseudo-header sum in its checksum field. Finish it here, or everything
-	// downstream sees a corrupt packet.
+	// An ordinary frame carrying only a pseudo-header sum is finished here; a
+	// super-frame is not, because its partial is what the segmenter works
+	// from. completeOffloads has the whole argument.
+	//
 	// Without a vnet header the kernel never reports a partial checksum, and
-	// this loop would still walk every descriptor to discover that; skip it
+	// this would still walk every descriptor to discover that; skip it
 	// outright on the configuration nearly everyone runs.
 	if !q.ring.vnet {
 		return q.descs, q.offs[:got]
 	}
-	for i := range q.descs {
-		o := &q.offs[i]
-		if o.Flags&packetio.OffloadNeedsCsum == 0 {
-			continue
-		}
-		if !completeL4(q.region.Frame(q.descs[i]), int(o.CsumStart), int(o.CsumOff)) {
-			// The offsets did not fit the frame. The packet is delivered with
-			// the partial still in it, which is wrong on the wire, so say so
-			// rather than let it pass for correct.
-			q.badCsum.Add(1)
-		}
+	var completed []bool
+	if cont != nil {
+		completed = cont[:got]
+	}
+	if bad := completeOffloads(q.offs[:got], completed, func(i int) []byte {
+		return q.region.Frame(q.descs[i])
+	}); bad != 0 {
+		q.badCsum.Add(uint64(bad))
 	}
 	return q.descs, q.offs[:got]
 }
@@ -360,6 +402,13 @@ func (q *RxQueue) NumReceived() int {
 // Stats reports what this queue received, plus what the kernel dropped on its
 // behalf. The kernel figure is the important one: it is the only evidence that
 // a receiver fell behind, and it is invisible everywhere else.
+//
+// Packets counts frames, not wire packets: a packet delivered as a chain of
+// several under [WithMultiBuffer] counts once per frame, which is what keeps
+// it consistent with the pool arithmetic. Backend["oversize"] is every packet
+// dropped for not fitting, and Backend["batch_too_small"] is the part of that
+// caused by the caller's max rather than its frame size -- the part a bigger
+// batch would have fixed.
 func (q *RxQueue) Stats() (packetio.RxStats, error) {
 	if !q.closed.Load() {
 		q.readKernelStats()
@@ -375,10 +424,11 @@ func (q *RxQueue) Stats() (packetio.RxStats, error) {
 		Backend: map[string]uint64{
 			// A block freeze is the signal that this reader is too slow: the
 			// kernel had no block to fill and had to wait for one back.
-			"freeze_q_count": q.freeze.Load(),
-			"bad_checksum":   q.badCsum.Load(),
-			"oversize":       q.ring.oversize.Load(),
-			"pool_rejected":  q.pool.Rejected(),
+			"freeze_q_count":  q.freeze.Load(),
+			"bad_checksum":    q.badCsum.Load(),
+			"oversize":        q.ring.oversize.Load(),
+			"batch_too_small": q.ring.batchTooSmall.Load(),
+			"pool_rejected":   q.pool.Rejected(),
 		},
 	}, nil
 }
