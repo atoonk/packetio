@@ -36,6 +36,18 @@ import (
 // suite that skips is then a failure rather than a quiet nothing.
 func Required() bool { return os.Getenv("PACKETIO_CONFORM_REQUIRED") != "" }
 
+// cannotRun skips, or fails when the suite was required to run. It is for the
+// conditions that stop a check part-way -- no traffic, no queue -- which are
+// the ones that quietly turn a suite into a decoration.
+func cannotRun(t *testing.T, msg string) {
+	t.Helper()
+	if Required() {
+		t.Fatalf("%s, and PACKETIO_CONFORM_REQUIRED is set: this check was supposed "+
+			"to run, so this is a failure rather than a skip", msg)
+	}
+	t.Skip(msg)
+}
+
 // cannotOpen skips, or fails when the suite was required to run.
 func cannotOpen(t *testing.T) {
 	t.Helper()
@@ -634,5 +646,104 @@ func rxBatchesCounted(t *testing.T, open OpenFunc) {
 	if batches > got {
 		t.Errorf("%d batches for %d packets: a batch is a call that returned "+
 			"packets, so it cannot exceed them", batches, got)
+	}
+}
+
+// RunTimestamps checks a backend that claims Capabilities.RxTimestamps: the
+// interface is really there, and the times it reports are usable.
+//
+// It needs traffic, which the suite cannot make on its own, so send is the
+// caller's: it puts packets on the wire and returns how many, or zero if it
+// cannot. A run that sees nothing skips rather than passes, on the rule that a
+// skipped test and a passing test must not print the same word.
+func RunTimestamps(t *testing.T, open OpenFunc, send func(t *testing.T, d Device) int) {
+	t.Helper()
+	d := open(t)
+	if d == nil {
+		cannotOpen(t)
+		return
+	}
+	defer d.Close()
+
+	if d.NumRxQueues() == 0 {
+		cannotRun(t, "device has no receive queue")
+		return
+	}
+	if !d.Capabilities().RxTimestamps {
+		// Not claiming it is a complete answer; claiming it and not having it
+		// is what this checks. A queue may still carry the method -- Go
+		// interfaces are satisfied by the type, not the device -- but then it
+		// must refuse rather than invent times, which is checked below.
+		if rq, ok := d.RxQueue(0).(packetio.TimestampReceiver); ok {
+			if descs, ts := rq.ReceiveTimestamps(8); descs != nil || ts != nil {
+				t.Error("the device reports no timestamps, but ReceiveTimestamps returned some anyway")
+			}
+		}
+		t.Skip("backend does not stamp received packets")
+	}
+	rq, ok := d.RxQueue(0).(packetio.TimestampReceiver)
+	if !ok {
+		t.Fatal("Capabilities.RxTimestamps is true but the queue is not a TimestampReceiver")
+	}
+	rq.Fill(rq.NumFreeFillSlots())
+
+	if send(t, d) == 0 {
+		cannotRun(t, "no traffic to timestamp")
+		return
+	}
+
+	var descs []packetio.Desc
+	var ts []uint64
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		rq.Poll(100 * time.Millisecond)
+		if descs, ts = rq.ReceiveTimestamps(64); len(descs) > 0 {
+			break
+		}
+		rq.Fill(rq.NumFreeFillSlots())
+	}
+	if len(descs) == 0 {
+		cannotRun(t, "nothing arrived to timestamp")
+		return
+	}
+	defer func() {
+		if descs != nil {
+			rq.Recycle(descs)
+		}
+	}()
+
+	if len(ts) != len(descs) {
+		t.Fatalf("%d timestamps for %d descriptors: the slices must match", len(ts), len(descs))
+	}
+	inversions := 0
+	for i, v := range ts {
+		// Zero is the one value a timestamp may never take: it would say a
+		// packet arrived at the epoch, and a caller cannot tell it from a
+		// backend that filled nothing in.
+		if v == 0 {
+			t.Errorf("packet %d has a zero timestamp", i)
+		}
+		if i > 0 && v < ts[i-1] {
+			inversions++
+		}
+	}
+	// Arrival order is not delivery order: a NIC stamps at the port and
+	// places afterwards, so a card that is dropping delivers some packets out
+	// of stamp order. A few inversions are the hardware being honest. Most of
+	// them being inversions is a backend reading the wrong field, which is the
+	// failure worth catching.
+	if len(ts) > 4 && inversions > len(ts)/2 {
+		t.Errorf("%d of %d timestamps go backwards: this is not a clock", inversions, len(ts))
+	}
+	// The plain path must still work alongside the extended one. It shares
+	// the queue's scratch, so a backend that got the sharing wrong hands back
+	// descriptors that do not match what it just reported.
+	rq.Recycle(descs)
+	descs = nil
+	rq.Fill(rq.NumFreeFillSlots())
+	if again := rq.Receive(8); again == nil && rq.Err() != nil {
+		t.Errorf("Receive stopped working after ReceiveTimestamps: %v", rq.Err())
+	} else {
+		rq.Recycle(again)
 	}
 }

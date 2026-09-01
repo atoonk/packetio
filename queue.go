@@ -263,6 +263,11 @@ type Capabilities struct {
 	// RxChecksumFlags is true when received descriptors carry OptChecksumOK.
 	RxChecksumFlags bool
 
+	// RxTimestamps is true when the receive queues implement
+	// [TimestampReceiver], so every packet arrives with the time the device
+	// recorded for it.
+	RxTimestamps bool
+
 	// BlockingPoll is true when RxQueue.Poll can sleep rather than spin.
 	BlockingPoll bool
 

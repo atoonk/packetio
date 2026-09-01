@@ -227,9 +227,22 @@ func (r *Rx) Fill(descs []packetio.Desc) int {
 // because they hold nothing worth looking at but must still find their way back
 // to the pool.
 func (r *Rx) Receive(max int, out []packetio.Desc) []packetio.Desc {
+	descs, _ := r.receive(max, out, nil)
+	return descs
+}
+
+// ReceiveTimestamps is Receive, and also appends each packet's completion
+// timestamp -- raw ticks of the device's clock, converted by the caller, which
+// knows the rate. Passing a nil slice is Receive: the read costs nothing on the
+// path that did not ask for it.
+func (r *Rx) ReceiveTimestamps(max int, out []packetio.Desc, ts []uint64) ([]packetio.Desc, []uint64) {
+	return r.receive(max, out, ts)
+}
+
+func (r *Rx) receive(max int, out []packetio.Desc, ts []uint64) ([]packetio.Desc, []uint64) {
 	r.failed = r.failed[:0]
 	if max <= 0 || r.dead.Load() != nil {
-		return out
+		return out, ts
 	}
 
 	var (
@@ -338,6 +351,9 @@ func (r *Rx) Receive(max int, out []packetio.Desc) []packetio.Desc {
 			}
 		}
 		out = append(out, d)
+		if ts != nil {
+			ts = append(ts, wqe.Timestamp(entry))
+		}
 		got++
 		bytes += uint64(length)
 	}
@@ -346,7 +362,7 @@ func (r *Rx) Receive(max int, out []packetio.Desc) []packetio.Desc {
 		if r.pi == r.ci {
 			r.Sync() // the queue is idle, so this costs nothing
 		}
-		return out
+		return out, ts
 	}
 	r.c.completions += read
 	r.c.batches++
@@ -358,7 +374,7 @@ func (r *Rx) Receive(max int, out []packetio.Desc) []packetio.Desc {
 	var db [4]byte
 	binary.BigEndian.PutUint32(db[:], r.cqci&0xffffff)
 	arch.ReleaseCQ(r.cqDbrec, nativeU32(db[:]))
-	return out
+	return out, ts
 }
 
 // fail takes the queue out of service. The first reason is kept: it is the one

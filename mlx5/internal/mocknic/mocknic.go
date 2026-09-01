@@ -515,6 +515,13 @@ type RxNIC struct {
 	FailEvery int
 	delivered int
 
+	// TicksPerPacket is how far the model's clock advances between
+	// completions. Zero leaves it at one tick, so time still moves: a
+	// stationary clock is not something hardware does, and a test that
+	// depended on one would be testing the model, not the ring.
+	TicksPerPacket uint64
+	clock          uint64
+
 	Violations []string
 }
 
@@ -610,6 +617,15 @@ func (n *RxNIC) writeCompletion(slot uint32, opcode uint8, length uint32) {
 		e[i] = 0
 	}
 	binary.BigEndian.PutUint32(e[44:], length)
+	// A real device stamps every completion from a free-running clock. The
+	// model advances one so that a test reading timestamps sees time pass
+	// rather than the zeroes the wipe above would otherwise leave -- a
+	// timestamp test against a constant zero passes while proving nothing.
+	if n.TicksPerPacket == 0 {
+		n.TicksPerPacket = 1
+	}
+	n.clock += n.TicksPerPacket
+	binary.BigEndian.PutUint64(e[48:], n.clock)
 	e[28] = wqe.CQEL2OK | wqe.CQEL3OK | wqe.CQEL4OK
 	binary.BigEndian.PutUint16(e[60:], uint16(slot))
 	e[63] = opcode<<4 | uint8(n.cq.ExpectedOwner(n.cqPi))

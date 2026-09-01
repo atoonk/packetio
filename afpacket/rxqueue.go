@@ -45,6 +45,7 @@ type RxQueue struct {
 	lens  []int
 	descs []packetio.Desc
 	offs  []packetio.Offload
+	tss   []uint64
 	addrs []uint64
 
 	// The counters are atomics because Stats reads them from a monitoring
@@ -193,7 +194,7 @@ func (q *RxQueue) ready() int {
 // Receive copies up to max packets out of the ring into free frames and returns
 // descriptors naming them. The returned slice is reused by the next call.
 func (q *RxQueue) Receive(max int) []packetio.Desc {
-	d, _ := q.receive(max)
+	d, _ := q.receive(max, false)
 	return d
 }
 
@@ -203,10 +204,32 @@ func (q *RxQueue) Receive(max int) []packetio.Desc {
 //
 // It implements [packetio.OffloadReceiver].
 func (q *RxQueue) ReceiveOffload(max int) ([]packetio.Desc, []packetio.Offload) {
-	return q.receive(max)
+	return q.receive(max, false)
 }
 
-func (q *RxQueue) receive(max int) ([]packetio.Desc, []packetio.Offload) {
+// ReceiveTimestamps is Receive, and also returns when the kernel stamped each
+// frame, in nanoseconds.
+//
+// The clock is CLOCK_REALTIME: this backend does not offer PACKET_TIMESTAMP,
+// so it is always the kernel's wall-clock reading as the frame went into the
+// ring, not the wire time a NIC would record. Being the wall clock, it can
+// step: an adjustment moves these stamps with it, so a long measurement should
+// treat a large jump as the clock being set rather than as traffic.
+//
+// Offload metadata is not carried on this path. A device opened [WithGSO]
+// whose caller needs both should use ReceiveOffload and read the times from
+// its own clock, or open a second queue.
+//
+// It implements [packetio.TimestampReceiver].
+func (q *RxQueue) ReceiveTimestamps(max int) ([]packetio.Desc, []uint64) {
+	d, _ := q.receive(max, true)
+	if d == nil {
+		return nil, nil
+	}
+	return d, q.tss[:len(d)]
+}
+
+func (q *RxQueue) receive(max int, wantTimestamps bool) ([]packetio.Desc, []packetio.Offload) {
 	if q.closed.Load() || max <= 0 {
 		return nil, nil
 	}
@@ -222,6 +245,15 @@ func (q *RxQueue) receive(max int) ([]packetio.Desc, []packetio.Offload) {
 	}
 	if cap(q.offs) < max {
 		q.offs = make([]packetio.Offload, max)
+	}
+	// Only a caller that asked pays for the walk to fill this; the ring skips
+	// the read entirely when it is nil.
+	var tss []uint64
+	if wantTimestamps {
+		if cap(q.tss) < max {
+			q.tss = make([]uint64, max)
+		}
+		tss = q.tss[:max]
 	}
 	q.descs = q.descs[:0]
 
@@ -239,7 +271,7 @@ func (q *RxQueue) receive(max int) ([]packetio.Desc, []packetio.Offload) {
 		}
 		q.descs = append(q.descs, packetio.Desc{Addr: q.addrs[0] + frameHeadroom})
 		return q.region.Writable(q.descs[i])
-	}, q.lens[:max], q.offs[:max])
+	}, q.lens[:max], q.offs[:max], tss)
 
 	// A frame may have been taken for a slot that produced nothing, when the
 	// walk ended on an oversized frame. Give those back -- by frame start,
@@ -408,6 +440,7 @@ func (q *RxQueue) Err() error {
 }
 
 var (
-	_ packetio.RxQueue         = (*RxQueue)(nil)
-	_ packetio.OffloadReceiver = (*RxQueue)(nil)
+	_ packetio.TimestampReceiver = (*RxQueue)(nil)
+	_ packetio.RxQueue           = (*RxQueue)(nil)
+	_ packetio.OffloadReceiver   = (*RxQueue)(nil)
 )

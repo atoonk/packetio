@@ -564,3 +564,82 @@ func TestMultiQueueReceiveDeliversOnEveryQueue(t *testing.T) {
 			live, len(perQueue), perQueue)
 	}
 }
+
+// Timestamps come from the kernel's own frame header, so a packet that
+// arrives carries the time it arrived. The properties worth holding: one
+// timestamp per descriptor, none of them zero (a zero time is a lie, not a
+// default), and time does not run backwards within a batch.
+func TestVethReceiveTimestamps(t *testing.T) {
+	needRoot(t)
+	name, peer := vethPair(t)
+
+	d, err := Open(name, WithTxQueues(0), WithRxQueues(1), WithPromiscuous())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	sender, err := Open(peer, WithTxQueues(1), WithRxQueues(0))
+	if err != nil {
+		t.Fatalf("open sender on %s: %v", peer, err)
+	}
+	defer sender.Close()
+	if !d.Capabilities().RxTimestamps {
+		t.Fatal("afpacket does not claim RxTimestamps")
+	}
+	rx, ok := d.RxQueue(0).(packetio.TimestampReceiver)
+	if !ok {
+		t.Fatal("the receive queue is not a TimestampReceiver")
+	}
+	rx.Fill(rx.NumFreeFillSlots())
+
+	before := uint64(time.Now().UnixNano())
+	if _, err := sender.TxQueue(0).SendFunc(8, func(i int, buf []byte) int {
+		return copy(buf, frame(byte(i), 100))
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	var descs []packetio.Desc
+	var ts []uint64
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := rx.Poll(200 * time.Millisecond); err != nil {
+			t.Fatalf("Poll: %v", err)
+		}
+		if descs, ts = rx.ReceiveTimestamps(16); len(descs) > 0 {
+			break
+		}
+	}
+	if len(descs) == 0 {
+		t.Skip("nothing arrived on the veth pair")
+	}
+	after := uint64(time.Now().UnixNano())
+
+	if len(ts) != len(descs) {
+		t.Fatalf("%d timestamps for %d packets", len(ts), len(descs))
+	}
+	for i, v := range ts {
+		if v == 0 {
+			t.Errorf("packet %d has a zero timestamp", i)
+		}
+		if i > 0 && v < ts[i-1] {
+			t.Errorf("time ran backwards: packet %d at %d after %d", i, v, ts[i-1])
+		}
+	}
+	// The kernel's clock here is the real one, so the stamps must sit inside
+	// the window this test was running. A backend stamping with something else
+	// would pass every check above and fail this one.
+	if ts[0] < before || ts[len(ts)-1] > after {
+		t.Errorf("timestamps %d..%d are outside the test window %d..%d",
+			ts[0], ts[len(ts)-1], before, after)
+	}
+	// The plain path must still work after the extended one: the two share
+	// the queue's scratch, so getting that sharing wrong shows up here.
+	rx.Recycle(descs)
+	rx.Fill(rx.NumFreeFillSlots())
+	if err := rx.Err(); err != nil {
+		t.Errorf("the queue failed after ReceiveTimestamps: %v", err)
+	}
+	rx.Recycle(rx.Receive(16))
+}

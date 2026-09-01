@@ -187,6 +187,19 @@ honour must fail loudly with `ErrUnsupported`, never succeed doing nothing: an
 assertion that lands in a method quietly returning zero values is worse than
 no interface at all, because nothing downstream can tell.
 
+`TimestampReceiver` follows the same shape and one extra rule, because a
+timestamp has no defensible zero: an offload of all zeroes means "an ordinary
+frame", but a time of zero is a claim that a packet arrived at the epoch, and
+nothing downstream can tell that from a real reading.
+
+So the rule is not "do not implement it" -- an interface in Go is satisfied by
+the type, and whether a particular device has a clock is not known until it is
+opened. The rule is that a queue whose device cannot stamp must **return
+nothing**: no descriptors and no times. `Capabilities.RxTimestamps` is the
+authority a caller should ask first, and `conform.RunTimestamps` checks both
+halves, that the capability is honest and that a queue without a clock refuses
+rather than invents.
+
 A backend may implement one direction and not the other: `dpdk` is an
 `OffloadTransmitter` - it can have the NIC compute checksums and segment a
 super-frame - but not an `OffloadReceiver`, because there is no LRO to report.

@@ -39,7 +39,7 @@ func drainOffload(r *ring, max, bufLen int) ([][]byte, []packetio.Offload, int) 
 			bufs = append(bufs, make([]byte, bufLen))
 		}
 		return bufs[i]
-	}, lens, offs)
+	}, lens, offs, nil)
 	out := make([][]byte, n)
 	for i := 0; i < n; i++ {
 		out[i] = bufs[i][:lens[i]]

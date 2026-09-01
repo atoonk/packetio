@@ -10,6 +10,7 @@ import (
 
 	"github.com/atoonk/packetio"
 	"github.com/atoonk/packetio/internal/pool"
+	"github.com/atoonk/packetio/mlx5/internal/clock"
 	"github.com/atoonk/packetio/mlx5/internal/dv"
 	"github.com/atoonk/packetio/mlx5/internal/ring"
 )
@@ -53,6 +54,16 @@ type RxQueue struct {
 	// not safe to run during Close.
 	ringMu sync.Mutex
 	closed atomic.Bool
+
+	// ticks is ReceiveTimestamps' scratch, reused by every call the way
+	// received is. Receive never touches it.
+	ticks []uint64
+
+	// clock converts those ticks, and carries the counter's wraps, so it
+	// belongs to the queue rather than the device: two queues would otherwise
+	// share one wrap count and correct each other's. Nil when the device
+	// reported no clock, which is what makes ReceiveTimestamps refuse.
+	clock *clock.Counter
 }
 
 // rxHeadroom is where a received packet starts within its frame: one cache
@@ -97,6 +108,10 @@ func (d *Device) newRxQueue(index, firstFrame, frames int) (*RxQueue, error) {
 		entries: r.Entries(),
 	}
 	q.fill = make([]packetio.Desc, 0, r.Entries())
+	q.ticks = make([]uint64, 0, r.Entries())
+	if info := (clock.Info{Mult: d.clock.Mult, Shift: d.clock.Shift, Mask: d.clock.Mask}); info.OK() {
+		q.clock = clock.New(info)
+	}
 	q.addrs = make([]uint64, 0, r.Entries())
 	q.received = make([]packetio.Desc, 0, r.Entries())
 	return q, nil
@@ -104,6 +119,42 @@ func (d *Device) newRxQueue(index, firstFrame, frames int) (*RxQueue, error) {
 
 // Region is the frame memory this queue receives into.
 func (q *RxQueue) Region() packetio.Region { return q.dev.region }
+
+// ReceiveTimestamps is Receive, and also reports when the NIC saw each packet,
+// in nanoseconds.
+//
+// The time is taken by the card as the frame arrives at the port -- before the
+// transfer to memory, before the completion, before this call -- so the
+// interval between two of them is what happened on the wire, whatever this
+// program was doing meanwhile. The epoch is the device's own and means
+// nothing; subtract two readings from one device and the answer is a duration.
+//
+// It implements [packetio.TimestampReceiver], and is only present on a device
+// whose Capabilities report RxTimestamps.
+func (q *RxQueue) ReceiveTimestamps(max int) ([]packetio.Desc, []uint64) {
+	if q.closed.Load() {
+		return nil, nil
+	}
+	q.autoPin()
+	if q.clock == nil {
+		// This device reported no clock, so there is no time to give. Saying
+		// so with nothing is the honest answer: handing back zeroes would be
+		// a claim that every packet arrived at the epoch, and nothing
+		// downstream could tell that from a real reading.
+		return nil, nil
+	}
+	q.received, q.ticks = q.ring.ReceiveTimestamps(max, q.received[:0], q.ticks[:0])
+	for _, d := range q.ring.Failed() {
+		q.pool.Push(q.pool.Base(d.Addr))
+	}
+	// The ring hands back raw ticks of the device's own counter; turning them
+	// into nanoseconds, and carrying the wraps of a counter far narrower than
+	// the number it produces, is internal/clock. Never a call into C.
+	for i, t := range q.ticks {
+		q.ticks[i] = q.clock.NS(t)
+	}
+	return q.received, q.ticks
+}
 
 // Pin places the calling goroutine on a processor of its own and reports which
 // one, or -1 if the device was opened with WithoutAffinity. The packet path
@@ -325,3 +376,8 @@ func (q *RxQueue) close() error {
 	q.dvq = nil
 	return err
 }
+
+var (
+	_ packetio.RxQueue           = (*RxQueue)(nil)
+	_ packetio.TimestampReceiver = (*RxQueue)(nil)
+)

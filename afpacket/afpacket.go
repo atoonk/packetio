@@ -257,6 +257,9 @@ func (d *Device) Capabilities() packetio.Capabilities {
 		SharedRegion:      true,
 		HandsBackFrames:   true,
 		Offload:           d.cfg.gso,
+		// The kernel stamps every frame into the ring whether or not anyone
+		// reads it, so this needs no option and is never false here.
+		RxTimestamps: true,
 		// What a packet can actually be, not what a frame measures: receive
 		// starts frameHeadroom into the frame so a forwarder has room to
 		// prepend a tag, and those bytes are not available to the packet.

@@ -121,6 +121,33 @@ func Open(ibdev string, port uint32) (*Device, error) {
 	return d, nil
 }
 
+// ClockInfo is how to read the timestamp in a completion: a duration in
+// nanoseconds is (ticks & Mask) * Mult >> Shift.
+//
+// Mult is zero on a device that does not report a clock, and then the
+// timestamps in its completions mean nothing.
+type ClockInfo struct {
+	Mult  uint32
+	Shift uint32
+	Mask  uint64
+}
+
+// ClockInfo asks how the device's timestamps convert to nanoseconds. It is
+// read once, at Open: the conversion does not change while the device is open,
+// so the packet path never calls C for it.
+//
+// There is no error: a device that does not report a clock comes back with a
+// zero Mult, which says it cannot timestamp. Nothing else can go wrong here,
+// so the call does not pretend it can.
+func (d *Device) ClockInfo() ClockInfo {
+	var (
+		mult, shift C.uint32_t
+		mask        C.uint64_t
+	)
+	C.pio_clock_info(d.ctx, &mult, &shift, &mask)
+	return ClockInfo{Mult: uint32(mult), Shift: uint32(shift), Mask: uint64(mask)}
+}
+
 // Caps describes the device.
 func (d *Device) Caps() Caps { return d.caps }
 

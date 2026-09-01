@@ -505,3 +505,42 @@ func TestReceiveLatchesAnUndecodableCompletion(t *testing.T) {
 		t.Errorf("errors went from %d to %d: the queue is re-reading the same entry", before, after)
 	}
 }
+
+// The completion carries the device's clock reading, and the ring hands it back
+// only to a caller that asked. The properties: one timestamp per descriptor,
+// never zero, and rising -- a device whose clock stood still, or a ring reading
+// the wrong offset in the completion, fails all three.
+func TestReceiveTimestampsRiseWithEachPacket(t *testing.T) {
+	r := newRxRig(t, 16, 16, 32, 2048)
+	r.nic.TicksPerPacket = 100
+	r.fill(0, 1, 2, 3)
+
+	pkts := packets(64, 128, 60, 256)
+	if n := r.nic.Deliver(pkts); n != 4 {
+		t.Fatalf("the model delivered %d packets, want 4", n)
+	}
+
+	descs, ts := r.rx.ReceiveTimestamps(8, nil, make([]uint64, 0, 8))
+	r.rx.Sync()
+	if len(descs) != 4 {
+		t.Fatalf("received %d packets, want 4", len(descs))
+	}
+	if len(ts) != len(descs) {
+		t.Fatalf("%d timestamps for %d packets", len(ts), len(descs))
+	}
+	for i, v := range ts {
+		if v == 0 {
+			t.Errorf("packet %d has a zero timestamp", i)
+		}
+		if i > 0 && v <= ts[i-1] {
+			t.Errorf("the clock did not advance: packet %d at %d follows %d", i, v, ts[i-1])
+		}
+	}
+	if got, want := ts[3]-ts[0], uint64(3*100); got != want {
+		t.Errorf("the clock advanced %d ticks over four packets, want %d", got, want)
+	}
+	for _, d := range descs {
+		r.owner[d.Addr] = "app"
+	}
+	r.recycle(descs)
+}

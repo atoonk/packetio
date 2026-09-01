@@ -101,7 +101,7 @@ func drain(r *ring, max, bufLen int) ([][]byte, int) {
 			bufs = append(bufs, make([]byte, bufLen))
 		}
 		return bufs[i]
-	}, lens, nil)
+	}, lens, nil, nil)
 	out := make([][]byte, n)
 	for i := 0; i < n; i++ {
 		out[i] = bufs[i][:lens[i]]
@@ -315,7 +315,7 @@ func TestRingStopsWhenNoBufferIsOffered(t *testing.T) {
 			return nil // the pool has run dry
 		}
 		return buf
-	}, lens, nil)
+	}, lens, nil, nil)
 	if n != 1 {
 		t.Fatalf("read %d, want 1 before the pool ran dry", n)
 	}

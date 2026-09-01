@@ -30,12 +30,17 @@ import (
 type Device struct {
 	dev    *dv.Device
 	region *region
-	tx     []*TxQueue
-	rx     []*RxQueue
-	rxg    *dv.RxGroup
-	info   Info
-	cfg    config
-	place  *placement
+
+	// clock converts a completion's timestamp to nanoseconds. Mult is zero on
+	// a device that does not report a clock, and then the queues do not offer
+	// timestamps at all.
+	clock dv.ClockInfo
+	tx    []*TxQueue
+	rx    []*RxQueue
+	rxg   *dv.RxGroup
+	info  Info
+	cfg   config
+	place *placement
 	// closeMu makes Close idempotent against a concurrent second call, which
 	// would otherwise both pass the flag and destroy the queues twice.
 	closeMu sync.Mutex
@@ -242,6 +247,11 @@ func Open(ifname string, opts ...Option) (d *Device, err error) {
 	// only way to learn it is to let the provider lay out a send and look --
 	// which needs the region registered, and is why the sizing above was
 	// provisional.
+	// How the NIC's completion timestamps convert to nanoseconds. A device
+	// that reports no clock cannot timestamp, which is a capability rather
+	// than a failure to open, so there is nothing to check here.
+	d.clock = d.dev.ClockInfo()
+
 	required, err := d.dev.MinInline()
 	if err != nil {
 		// This is the first thing that creates a queue pair, so on a machine
@@ -658,6 +668,7 @@ func (d *Device) Capabilities() packetio.Capabilities {
 		RSS:               len(d.rx) > 1, // Toeplitz over IPv4 addresses and UDP ports
 		TxChecksumOffload: true,
 		RxChecksumFlags:   true,
+		RxTimestamps:      d.clock.Mult != 0,
 		BlockingPoll:      false, // polling only, for now
 		SharedRegion:      true,
 		HandsBackFrames:   true,

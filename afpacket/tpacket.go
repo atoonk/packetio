@@ -279,7 +279,7 @@ func (r *ring) advance(next uint32) {
 // called more than once with the same i, because a frame that does not fit the
 // buffer is skipped without producing output, and the caller is expected to
 // hand back the same buffer rather than a fresh one.
-func (r *ring) read(max int, dst func(i int) []byte, lens []int, offs []packetio.Offload) int {
+func (r *ring) read(max int, dst func(i int) []byte, lens []int, offs []packetio.Offload, tss []uint64) int {
 	out := 0
 	// Drain consecutive ready blocks until max is met or the ring runs dry.
 	// Each block goes back to the kernel the moment it is empty -- holding a
@@ -360,6 +360,13 @@ blocks:
 					}
 				}
 				offs[out] = o
+			}
+			if tss != nil {
+				// The kernel stamps every frame as it puts it in the ring,
+				// whatever the socket asked for, so this costs a read and
+				// nothing else. Which clock it used is PACKET_TIMESTAMP's
+				// business; the header carries the answer either way.
+				tss[out] = uint64(tph.tpSec)*1e9 + uint64(tph.tpNsec)
 			}
 			out++
 			r.advance(next)

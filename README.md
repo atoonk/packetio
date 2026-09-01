@@ -333,6 +333,8 @@ sudo go run ./examples/hello -i eth0
 | [`dpdk/blast`](examples/dpdk/blast) | the generator, over DPDK | dpdk |
 | [`dpdk/drop`](examples/dpdk/drop) | the receive cycle with the NIC's own counters | dpdk |
 | [`dpdk/l3fwd`](examples/dpdk/l3fwd) | the same router, sharing its forwarding code | dpdk |
+| [`timestamps`](examples/timestamps) | when packets really arrived, and the gaps between them | any |
+| [`pingpong`](examples/pingpong) | round trips between two machines, split by where the time went | mlx5 |
 | [`sweep`](examples/sweep) | every backend through the same three loops; the Performance tables above | mlx5, dpdk, afxdp |
 
 ```bash
@@ -343,6 +345,98 @@ There is no separate AF_XDP example because none is needed: the loop in any of
 these runs on it unchanged once you open with a steering filter, which is two
 lines shown in its [README](afxdp/). AF_XDP-specific tooling lives in
 [go-afxdp](https://github.com/atoonk/go-afxdp).
+
+## Timestamps: how long you held a packet
+
+The device records when each packet arrived, before your program is involved.
+Ask for those times and you can measure two things you otherwise cannot: **how
+long packets spend inside your program**, and **how evenly traffic is
+arriving**.
+
+```go
+if rx, ok := d.RxQueue(0).(packetio.TimestampReceiver); ok && d.Capabilities().RxTimestamps {
+        descs, ts := rx.ReceiveTimestamps(256)   // ts[i] is when descs[i] arrived
+}
+```
+
+That is the whole difference from an ordinary receive loop: one type
+assertion, and `Receive` becomes `ReceiveTimestamps`.
+
+**Why not just call `time.Now()` in the loop?** Because that measures the
+loop. If your program is busy for a millisecond, the fifty packets that
+arrived during it all get read at the same instant and look simultaneous. The
+card stamped each one as it came off the wire, before the transfer to memory,
+before the completion, before any of your code ran, so those stamps stay true
+whatever your program was doing.
+
+Nothing is written into the packet. The time goes in the completion the card
+writes beside it, so the sender neither cooperates nor notices, and traffic
+from anyone can be measured.
+
+### What you can and cannot learn from it
+
+You get one fixed reference point per packet: the moment it reached the port.
+Both ends of any interval you build from it are on **your** machine.
+
+    forwarding residency   arrival stamp  ->  when you hand it to transmit
+    your receive path      arrival stamp  ->  when your code first sees it
+    arrival jitter         one packet's stamp -> the next one's
+
+What you cannot get is how long a packet was **on the wire**, or a one-way
+delay from some sender to you. Both need a timestamp taken when the packet was
+*sent*, and no such thing travels in the packet. Those need two clocks
+disciplined to a common source, which this package does not do.
+
+### What it costs
+
+Nothing, unless you ask. `Receive` never reads the field, and no offload is
+switched on at the device: the card writes the timestamp into every completion
+whether or not anybody reads it. Measured against the build before the
+feature, receive was 44.19 -> 44.17 Mpps on one queue and 144.14 -> 143.97 on
+eight, both inside run-to-run noise.
+
+### Two things to know
+
+**The slices belong to the queue.** `descs` and `ts` are overwritten by the
+next receive call. Copy anything you mean to keep.
+
+**Arrival order is not delivery order.** A card stamps at the port and places
+the packet in a queue afterwards, so while it is dropping traffic the two come
+apart: at rates it keeps up with, stamps rise packet by packet (2 out of 9.1
+million out of order), but offer 148 Mpps to a queue that can take 44 and about
+a third arrive out of stamp order. Sort if you need order.
+
+| backend | stamps with | resolution | epoch |
+| --- | --- | --- | --- |
+| **mlx5** | the card, at the port | 4 ns | the device's own, meaningless on its own |
+| **afpacket** | the kernel, filling the ring | nanoseconds | CLOCK_REALTIME, so it can step |
+| **afxdp**, **dpdk** | not yet | | |
+
+### What it looks like in practice
+
+[`examples/pingpong`](examples/pingpong) times round trips between two
+machines and uses the stamps to say where the time went. Measured back to back
+on ConnectX-6 Dx, one queue, one frame in flight, no tuning of any kind:
+
+| frame | round trip (median) | of which, this program's receive path |
+| --- | ---: | ---: |
+| 64 B | 5.58 us | 0.49 us |
+| 1500 B | 6.32 us | 0.42 us |
+
+A round trip is a **software** number: it covers both machines' send and
+receive paths, and on a back-to-back cable the wire is tens of nanoseconds. It
+is not a network measurement, and the far end here is packetio too, so a full
+reflector cycle is inside every figure. What the stamp adds is the second
+column: without it there is only "5.58", and no way to say whose microseconds
+those were.
+
+`Capabilities().RxTimestamps` is the authority on whether a device really
+stamps. A queue may carry the method without the device having a clock, and
+then `ReceiveTimestamps` returns nothing rather than inventing zeroes: a zero
+would be a claim that a packet arrived at the epoch, and nothing downstream
+could tell that from a real reading.
+[`examples/timestamps`](examples/timestamps) is a working jitter meter in about
+a hundred lines, and it runs on any Linux box.
 
 ## Offload
 

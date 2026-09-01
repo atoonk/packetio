@@ -37,6 +37,27 @@ run as written.
 There is no `WithSteering` and no affinity option, and both absences are
 deliberate - see below.
 
+## Timestamps
+
+The kernel stamps every frame as it goes into the ring, and the backend hands
+that time to anyone who asks:
+
+```go
+rx, _ := d.RxQueue(0).(packetio.TimestampReceiver)
+descs, ts := rx.ReceiveTimestamps(256)
+```
+
+It costs nothing to offer, because the kernel writes the field whether or not
+it is read. The clock is CLOCK_REALTIME as the frame went into the ring, not a
+NIC reading off the wire, so it includes the trip up through the kernel and it
+can step when the wall clock is adjusted. For a time taken on the wire use a
+card that stamps, such as [mlx5](../mlx5/).
+
+Offload metadata does not come back on this path: a device opened `WithGSO`
+that needs both should use `ReceiveOffload`.
+[`examples/timestamps`](../examples/timestamps) is a jitter meter built on this
+and runs anywhere.
+
 ## Why there is no steering
 
 AF_PACKET is a **tap**, not a diversion. The kernel hands your socket a copy and

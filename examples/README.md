@@ -22,6 +22,29 @@ Read it before the others: it is the whole API - open, allocate, fill,
 transmit, fill, poll, receive, recycle, close - in one file with nothing else
 going on.
 
+## When packets arrived - runs anywhere too
+
+[`timestamps`](timestamps) asks the device when each packet turned up, rather
+than asking your own clock when you got round to looking, and prints the gaps
+between them. It uses AF_PACKET, so like `hello` it needs no hardware:
+
+```bash
+sudo go run ./examples/timestamps -i eth0 -d 10s
+```
+
+    listening on eth0 for 10s
+
+    412 packets, 411 gaps, in milliseconds:
+      shortest    0.099
+      median      1.204
+      p99        68.310
+      longest   201.887
+
+The gaps come from the time the kernel (or, on a ConnectX, the card) recorded
+as each packet arrived, so a busy moment in this program does not make the
+traffic look bursty. Swap the import and the Open call for `mlx5` and the same
+loop reads the card's own 4 ns clock.
+
 ## Direct Verbs (ConnectX) - `-tags mlx5`
 
 | | what it shows |
@@ -31,6 +54,7 @@ going on.
 | [`blast`](blast) | a generator: rate control, multiple queues, CPU placement |
 | [`drop`](drop) | the receive cycle and what it costs, with the port's counters |
 | [`steer`](steer) | ask for two UDP ports; watch only those arrive |
+| [`pingpong`](pingpong) | round trips between two machines, and where the time went |
 | [`l3fwd`](l3fwd) | an IPv4 router forwarding in the frame the packet arrived in |
 
 ```bash

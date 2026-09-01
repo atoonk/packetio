@@ -84,6 +84,19 @@ int  pio_reg_mr(pio_ctx *c, void *addr, size_t length, uint32_t *lkey,
 int  pio_min_inline(pio_ctx *c, void *sample, uint32_t *out,
 		    char *err, size_t errlen);
 
+/* How to turn a completion's timestamp into nanoseconds.
+ *
+ * The field in a completion counts ticks of the device's own free-running
+ * clock, so a duration is (ticks & mask) * mult >> shift -- the same
+ * arithmetic mlx5dv_ts_to_ns does, minus the epoch, which only matters for
+ * asking what time it was rather than how long something took. mult and shift
+ * do not change while the device is open, so this is read once and the packet
+ * path never calls C.
+ *
+ * A device that does not report a clock leaves mult zero; that is not an
+ * error, it is a device that cannot timestamp. */
+void pio_clock_info(pio_ctx *c, uint32_t *mult, uint32_t *shift, uint64_t *mask);
+
 /* pio_create_txq creates a raw Ethernet queue pair with room for depth work
  * requests, drives it to the ready-to-send state, and exposes its memory. */
 int  pio_create_txq(pio_ctx *c, uint32_t depth, struct pio_txq *q,

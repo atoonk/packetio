@@ -177,6 +177,26 @@ int pio_reg_mr(pio_ctx *c, void *addr, size_t length, uint32_t *lkey,
 	return 0;
 }
 
+void pio_clock_info(pio_ctx *c, uint32_t *mult, uint32_t *shift, uint64_t *mask)
+{
+	struct mlx5dv_clock_info ci;
+
+	*mult = 0;
+	*shift = 0;
+	*mask = 0;
+
+	memset(&ci, 0, sizeof(ci));
+	/* Not every device or driver offers it, and that is not a failure to
+	 * open: it means this device cannot timestamp, which the caller reports
+	 * as a capability rather than an error. The zeroes above are that
+	 * answer. */
+	if (mlx5dv_get_clock_info(c->ctx, &ci) == 0) {
+		*mult = ci.mult;
+		*shift = ci.shift;
+		*mask = ci.mask;
+	}
+}
+
 int pio_min_inline(pio_ctx *c, void *sample, uint32_t *out,
 		   char *err, size_t errlen)
 {
