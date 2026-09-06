@@ -76,12 +76,17 @@ func (c config) validate() error {
 			"least 65536, not %d -- or WithMultiBuffer, which lays an arriving "+
 			"super-frame across small frames instead. A transmit-only device needs "+
 			"neither: a packet given as a chain is gathered by the kernel.", c.frameSize)
-	case !c.gso && c.frameSize > rxFrameSize:
-		// A received frame is copied out of a ring whose frames are this size,
-		// so anything larger can never be filled from the ring and would just
-		// waste memory.
-		return fmt.Errorf("afpacket: frame size %d is larger than the %d-byte ring frame; "+
-			"use WithGSO for frames bigger than that", c.frameSize, rxFrameSize)
+	case !c.gso && c.frameSize > rxBlockSize:
+		// A received packet is copied out of the ring into a region frame, and
+		// the ring delivers packets up to a block less its headers: the ring
+		// frame size is how the blocks are cut up, not a ceiling on a packet.
+		// So a jumbo frame fits a 16 KiB region frame without GSO, and only
+		// a frame bigger than a whole block can never be filled. A packet the
+		// kernel had to clip to fit the block is counted oversize, not
+		// delivered short.
+		return fmt.Errorf("afpacket: frame size %d is larger than the %d-byte ring block, "+
+			"and the ring delivers nothing bigger than about 65400 bytes; use WithGSO "+
+			"for frames bigger than that", c.frameSize, rxBlockSize)
 	}
 	if c.frames < 64 {
 		return fmt.Errorf("afpacket: %d frames is too few", c.frames)
@@ -138,8 +143,10 @@ func WithFrames(n int) Option {
 
 // WithFrameSize sets the size of one frame. A packet starts a little way into
 // its frame, so the largest packet is smaller than this; ask
-// Capabilities().MaxFrameSize rather than assuming. It must be a power of two and no larger than the 2048-byte
-// ring frame the kernel receives into.
+// Capabilities().MaxFrameSize rather than assuming. It must be a power of two.
+// Without WithGSO the ceiling is the ring's 64 KiB block; the ring delivers
+// packets up to about 65400 bytes (the block less its headers) and counts
+// anything longer oversize. A 16384-byte frame carries a 9000-byte MTU whole.
 func WithFrameSize(n int) Option {
 	return func(c *config) { c.frameSize, c.frameSizeSet = n, true }
 }

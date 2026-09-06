@@ -335,6 +335,18 @@ blocks:
 			}
 			plen := int(tph.tpSnaplen)
 			d := frameOff + uint32(tph.tpMac)
+			if tph.tpSnaplen < tph.tpLen {
+				// The kernel clipped it: a packet longer than a block's
+				// payload area arrives with tp_snaplen cut and tp_len still
+				// saying how long it really was. That is a truncated packet
+				// with a plausible length, which is the one thing this loop
+				// must never deliver, so it is counted oversize and skipped.
+				// Unreachable through a ring frame -- only a region frame
+				// near the block size can hold what the kernel clipped.
+				r.oversize.Add(1)
+				r.advance(next)
+				continue
+			}
 
 			// The kernel strips the 802.1Q tag into the frame header. Put it back,
 			// so what the caller sees is what was on the wire.

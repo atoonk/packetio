@@ -304,9 +304,11 @@ type Capabilities struct {
 	// receiving.
 	HandsBackFrames bool
 
-	// MaxFrameSize is the largest single frame, and MaxQueues the most queues
-	// of either direction that can be opened: the backend's ceiling, lowered
-	// to the device's own limit where the backend can see it.
+	// MaxFrameSize is the largest packet one frame carries -- the frame less
+	// whatever headroom the backend or the kernel keeps in front of it -- and
+	// MaxQueues the most queues of either direction that can be opened: the
+	// backend's ceiling, lowered to the device's own limit where the backend
+	// can see it.
 	MaxFrameSize int
 	MaxQueues    int
 }

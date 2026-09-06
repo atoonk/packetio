@@ -216,7 +216,7 @@ func TestOpenRejectsBadConfiguration(t *testing.T) {
 	}{
 		{"no queues", []Option{WithTxQueues(0), WithRxQueues(0)}},
 		{"frame size not a power of two", []Option{WithFrameSize(1000)}},
-		{"frame size past the ring frame", []Option{WithFrameSize(8192)}},
+		{"frame size past the ring block", []Option{WithFrameSize(131072)}},
 		{"too few frames", []Option{WithFrames(8)}},
 		{"too many queues", []Option{WithQueues(maxQueues + 1)}},
 		{"gso frame too small", []Option{WithGSO(), WithFrameSize(2048)}},
@@ -1242,4 +1242,121 @@ func TestPlainSendAfterChainedSend(t *testing.T) {
 			"message wiring was left pointing at the chain's iovecs",
 			len(got[1]), len(plain))
 	}
+}
+
+// A jumbo frame arrives whole without GSO. The ring's 2048-byte frame size is
+// how its blocks are cut up, not a ceiling on a packet -- the kernel delivers
+// anything up to the block -- and Receive copies the packet into a region
+// frame, so a region frame big enough is all a 9000-byte MTU needs.
+func TestVethJumboFrameReceivedWhole(t *testing.T) {
+	needRoot(t)
+	a, b := vethPair(t)
+	for _, n := range []string{a, b} {
+		if out, err := exec.Command("ip", "link", "set", n, "mtu", "9000").CombinedOutput(); err != nil {
+			t.Skipf("cannot set the MTU of %s: %v: %s", n, err, out)
+		}
+	}
+
+	rx, err := Open(b, WithTxQueues(0), WithRxQueues(1), WithPromiscuous(), WithFrameSize(16384))
+	if err != nil {
+		t.Fatalf("open receiver on %s: %v", b, err)
+	}
+	defer rx.Close()
+	tx, err := Open(a, WithTxQueues(1), WithRxQueues(0), WithFrameSize(16384))
+	if err != nil {
+		t.Fatalf("open sender on %s: %v", a, err)
+	}
+	defer tx.Close()
+	if max := rx.Capabilities().MaxFrameSize; max < 9014 {
+		t.Fatalf("MaxFrameSize is %d with 16384-byte frames", max)
+	}
+
+	const n, size = 8, 9014 // a 9000-byte MTU plus the Ethernet header, the most the link takes
+	sent, err := tx.TxQueue(0).SendFunc(n, func(i int, buf []byte) int {
+		return copy(buf, frame(byte(i), size))
+	})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if sent != n {
+		t.Fatalf("sent %d of %d", sent, n)
+	}
+
+	rxq := rx.RxQueue(0)
+	var got [][]byte
+	deadline := time.Now().Add(3 * time.Second)
+	for len(got) < n && time.Now().Before(deadline) {
+		if _, err := rxq.Poll(200 * time.Millisecond); err != nil {
+			t.Fatalf("poll: %v", err)
+		}
+		descs := rxq.Receive(n)
+		for _, d := range descs {
+			if f := rxq.Region().Frame(d); ours(f) {
+				got = append(got, append([]byte(nil), f...))
+			}
+		}
+		rxq.Recycle(descs)
+	}
+	if len(got) < n {
+		st, _ := rxq.Stats()
+		t.Fatalf("received %d of %d jumbo frames (oversize %d)", len(got), n, st.Backend["oversize"])
+	}
+	for i := 0; i < n; i++ {
+		if want := frame(byte(i), size); !bytes.Equal(got[i], want) {
+			t.Fatalf("frame %d differs: got %d bytes, want %d", i, len(got[i]), len(want))
+		}
+	}
+}
+
+// A packet the kernel had to clip to fit a ring block is counted oversize, not
+// delivered short. TPACKET_V3 clamps tp_snaplen to the block's payload area
+// (about 65400 bytes) and leaves tp_len at the true length; a region frame big
+// enough to hold the clipped bytes is the only way to reach it, so this is the
+// one configuration where the check matters.
+func TestVethClippedPacketIsCountedOversize(t *testing.T) {
+	needRoot(t)
+	a, b := vethPair(t)
+	for _, n := range []string{a, b} {
+		if out, err := exec.Command("ip", "link", "set", n, "mtu", "65535").CombinedOutput(); err != nil {
+			t.Skipf("cannot set the MTU of %s: %v: %s", n, err, out)
+		}
+	}
+	rx, err := Open(b, WithTxQueues(0), WithRxQueues(1), WithPromiscuous(),
+		WithFrameSize(65536), WithFrames(256))
+	if err != nil {
+		t.Fatalf("open receiver on %s: %v", b, err)
+	}
+	defer rx.Close()
+	tx, err := Open(a, WithTxQueues(1), WithRxQueues(0), WithFrameSize(65536), WithFrames(256))
+	if err != nil {
+		t.Fatalf("open sender on %s: %v", a, err)
+	}
+	defer tx.Close()
+
+	const n = 4
+	size := rx.Capabilities().MaxFrameSize // fits the region frame, not the block
+	sent, err := tx.TxQueue(0).SendFunc(n, func(i int, buf []byte) int {
+		return copy(buf, frame(byte(i), size))
+	})
+	if err != nil || sent != n {
+		t.Fatalf("sent %d of %d: %v", sent, n, err)
+	}
+
+	rxq := rx.RxQueue(0)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rxq.Poll(200 * time.Millisecond)
+		descs := rxq.Receive(n)
+		for _, d := range descs {
+			if f := rxq.Region().Frame(d); ours(f) {
+				t.Fatalf("a %d-byte packet was delivered as %d bytes", size, len(f))
+			}
+		}
+		rxq.Recycle(descs)
+		if st, _ := rxq.Stats(); st.Backend["oversize"] >= n {
+			return
+		}
+	}
+	st, _ := rxq.Stats()
+	t.Fatalf("oversize is %d after %d clipped packets", st.Backend["oversize"], n)
 }
