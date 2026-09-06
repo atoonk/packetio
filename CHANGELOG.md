@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.4
 
 **dpdk: works without an IOMMU -- EC2's ENA, physical addressing, 2 MB
 pages.** Every mbuf's `buf_iova` was the region's *virtual* address: the
