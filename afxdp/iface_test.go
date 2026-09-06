@@ -104,3 +104,13 @@ func TestFreeGivesFramesBackToAlloc(t *testing.T) {
 }
 
 var _ = xdp.Desc{}
+
+// WithMultiBuffer is go-afxdp's option under this package's name; what it did
+// to the socket is read back through the socket, in go-afxdp's own tests.
+func TestWithMultiBufferPassesTheOptionThrough(t *testing.T) {
+	var cfg config
+	WithMultiBuffer()(&cfg)
+	if len(cfg.xdp) != 1 {
+		t.Fatalf("WithMultiBuffer added %d xdp options, want 1", len(cfg.xdp))
+	}
+}

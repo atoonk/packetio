@@ -3,7 +3,7 @@ module github.com/atoonk/packetio
 go 1.22
 
 require (
-	github.com/atoonk/go-afxdp v0.11.1
+	github.com/atoonk/go-afxdp v0.11.2
 	golang.org/x/sys v0.28.0
 )
 

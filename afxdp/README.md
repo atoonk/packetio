@@ -49,7 +49,12 @@ The ones every backend spells the same way:
 
     WithQueues(n)          how many queues to bind, from queue 0
     WithFrames(n)          frames in the UMEM
-    WithFrameSize(n)       2048 by default; some drivers need 4096 for zero-copy
+    WithFrameSize(n)       2048 by default; some drivers need 4096 for zero-copy.
+                           Capabilities().MaxFrameSize is the largest packet a
+                           frame takes: the frame less the 256 bytes the kernel
+                           keeps in front of every packet it writes
+    WithMultiBuffer()      a packet may span several frames, OptContinued on all
+                           but the last; Capabilities().MultiBuffer reports it
     WithSteering(f)        required - see above
     WithAffinity(cpus...)
     WithoutAffinity()
@@ -174,5 +179,5 @@ The examples in [`examples/`](../examples/) target mlx5 and dpdk, but the API is
 the same; swap the import and the `Open` call. Start with
 [`hello`](../examples/hello), which runs anywhere.
 
-For AF_XDP-specific tooling - packet generators, tcpdump-expression filters,
-jumbo frames - see [go-afxdp](https://github.com/atoonk/go-afxdp).
+For AF_XDP-specific tooling - packet generators, tcpdump-expression filters -
+see [go-afxdp](https://github.com/atoonk/go-afxdp).

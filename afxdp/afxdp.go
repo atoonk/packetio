@@ -142,6 +142,17 @@ func WithoutAffinity() Option {
 	return func(c *config) { c.xdp = append(c.xdp, xdp.WithoutAffinity()) }
 }
 
+// WithMultiBuffer binds the sockets for packets that span several frames -- a
+// jumbo frame over a 2048-byte frame size -- marked with OptContinued on every
+// frame but the last, as [packetio.Capabilities.MultiBuffer] describes. It is
+// go-afxdp's WithMultiBuffer under the name every backend here uses.
+//
+// Receive counts its batch in frames and may end it part-way through a chain,
+// the rest arriving next call; [RxQueue.ReceivePackets] returns whole packets.
+func WithMultiBuffer() Option {
+	return func(c *config) { c.xdp = append(c.xdp, xdp.WithMultiBuffer()) }
+}
+
 // WithXDP passes go-afxdp options straight through, for what this package does
 // not name: the XDP program, the ring geometry, the wakeup flags.
 //
@@ -227,13 +238,6 @@ func (d *Device) Fleet() *xdp.Fleet { return d.fleet }
 func (d *Device) Capabilities() packetio.Capabilities {
 	caps := packetio.Capabilities{
 		Backend: "afxdp",
-		// go-afxdp opens single-buffer sockets: one packet is one frame,
-		// never a chain, so OptContinued will not be seen. Multi-buffer
-		// exists behind WithXDP(xdp.WithMultiBuffer()), but an option
-		// carried through is invisible here, and a capability describes the
-		// device that was opened, not one that could have been. False is
-		// the safe direction: the caller who enabled it knows they did.
-		MultiBuffer: false,
 		// The XDP program redirects only what the filter matches; the rest
 		// carries on up the kernel's own stack.
 		KernelCoexistence: true,
@@ -248,7 +252,17 @@ func (d *Device) Capabilities() packetio.Capabilities {
 	if len(d.tx) > 0 {
 		zc, err := d.tx[0].s.ZeroCopy()
 		caps.ZeroCopy = err == nil && zc
-		caps.MaxFrameSize = d.tx[0].s.FrameSize()
+		// MultiBuffer and MaxFrameSize are both read off the socket, so they
+		// describe how it was bound however that was asked for --
+		// WithMultiBuffer, WithXDP, or a fleet the caller built. Sockets are
+		// single-buffer unless asked: one packet is
+		// one frame, never a chain. Bound for multi-buffer, the kernel's
+		// continuation bit reaches Receive's descriptors unchanged as
+		// OptContinued, which is what MultiBuffer promises. MaxPacket is the
+		// frame less the headroom the kernel keeps in front of every packet
+		// it writes, not the frame.
+		caps.MultiBuffer = d.tx[0].s.MultiBuffer()
+		caps.MaxFrameSize = d.tx[0].s.MaxPacket()
 	}
 	return caps
 }
