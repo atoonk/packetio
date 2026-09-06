@@ -56,6 +56,8 @@ type config struct {
 	csum     bool
 	devargs  string
 	size     int
+	frameSz  int
+	mtu      int
 }
 
 func main() {
@@ -68,13 +70,15 @@ func main() {
 		outer  = flag.Int("outer-vlan", 0, "outer VLAN id, for double-tagged frames")
 		size   = flag.Int("size", 64, "frame size on the wire including the 4-byte check sequence the NIC adds")
 
-		queues = flag.Int("queues", 1, "transmit queues to use")
-		perWkr = flag.Int("queues-per-worker", 1, "queues one worker drives, round-robin")
-		batch  = flag.Int("batch", 256, "packets per transmit batch; the cgo crossing is per batch, not per packet")
-		depth  = flag.Int("depth", 1024, "transmit queue depth in packets")
-		frames = flag.Int("frames", 0, "frames in the region; 0 sizes it from the queues")
-		cpus   = flag.String("cpus", "", "processors to pin the workers to, for example 4,6 or 8-11")
-		noAff  = flag.Bool("no-affinity", false, "leave the workers wherever the scheduler puts them")
+		queues  = flag.Int("queues", 1, "transmit queues to use")
+		perWkr  = flag.Int("queues-per-worker", 1, "queues one worker drives, round-robin")
+		batch   = flag.Int("batch", 256, "packets per transmit batch; the cgo crossing is per batch, not per packet")
+		depth   = flag.Int("depth", 1024, "transmit queue depth in packets")
+		frames  = flag.Int("frames", 0, "frames in the region; 0 sizes it from the queues")
+		frameSz = flag.Int("frame-size", 0, "bytes per frame; 0 is the backend's default. A jumbo -size needs a frame that holds it")
+		mtu     = flag.Int("mtu", 0, "MTU to configure the port for; 0 is the backend's default")
+		cpus    = flag.String("cpus", "", "processors to pin the workers to, for example 4,6 or 8-11")
+		noAff   = flag.Bool("no-affinity", false, "leave the workers wherever the scheduler puts them")
 
 		duration = flag.Duration("duration", 10*time.Second, "how long to run")
 		report   = flag.Duration("report", time.Second, "how often to print a line")
@@ -103,7 +107,7 @@ func main() {
 		dev: *dev, iface: *iface, queues: *queues, perWkr: *perWkr,
 		batch: *batch, depth: *depth, frames: *frames, noAff: *noAff,
 		dur: *duration, report: *report, ghz: *ghz, pps: *pps, prebuilt: *prebuilt, csum: *csum,
-		devargs: *devargs, size: *size,
+		devargs: *devargs, size: *size, frameSz: *frameSz, mtu: *mtu,
 	}
 	if c.iface == "" && !strings.Contains(*dev, ":") && !strings.HasPrefix(*dev, "net_") {
 		c.iface = *dev
@@ -172,6 +176,12 @@ func run(c config, dm, sm string, vlan, outer int, si, di string, dport, flows, 
 	opts := []dpdk.Option{
 		dpdk.WithTxQueues(c.queues), dpdk.WithRxQueues(0),
 		dpdk.WithTxDepth(c.depth), dpdk.WithFrames(frames),
+	}
+	if c.frameSz > 0 {
+		opts = append(opts, dpdk.WithFrameSize(c.frameSz))
+	}
+	if c.mtu > 0 {
+		opts = append(opts, dpdk.WithMTU(c.mtu))
 	}
 	if c.csum {
 		opts = append(opts, dpdk.WithChecksumOffload())

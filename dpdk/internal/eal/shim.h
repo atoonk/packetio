@@ -129,6 +129,10 @@ int  pio_tx_queue_setup(uint16_t port, uint16_t q, uint16_t desc, int socket,
 int  pio_start(uint16_t port, char *err, size_t errlen);
 int  pio_stop(uint16_t port, char *err, size_t errlen);
 int  pio_eal_close(uint16_t port, char *err, size_t errlen);
+/* pio_promiscuous returns PIO_ENOTSUP -- positive, so it cannot be mistaken
+ * for failf's -1 -- when the driver simply has no promiscuous mode, as the ENA
+ * on EC2 does not. (The null vdev has one: it is born promiscuous.) */
+#define PIO_ENOTSUP 1
 int  pio_promiscuous(uint16_t port, int on, char *err, size_t errlen);
 
 /* pio_link_status reports whether the port has carrier and at what speed.
@@ -138,11 +142,11 @@ int  pio_link_status(uint16_t port, int *up, uint32_t *speed_mbps);
 
 /* --------------------------------------------------------------- the memory */
 
-/* pio_region_reserve takes one IOVA-contiguous memzone for the frames. Its
- * address is what every descriptor is an offset into, and its IOVA is what the
- * NIC knows the same memory by. */
+/* pio_region_reserve takes one memzone for the frames. Its address is what
+ * every descriptor is an offset into, and page_size is the size of the pages
+ * it sits on, which is how far apart the NIC's addresses for it may jump. */
 int  pio_region_reserve(const char *name, size_t size, size_t align, int socket,
-			void **addr, uint64_t *iova, char *err, size_t errlen);
+			void **addr, uint64_t *page_size, char *err, size_t errlen);
 int  pio_region_free(const char *name, char *err, size_t errlen);
 
 /* pio_mempool_new builds one queue's mempool over its slice of the region.
@@ -154,8 +158,14 @@ int  pio_region_free(const char *name, char *err, size_t errlen);
  * what lets packetio's frame arithmetic survive.
  *
  * The objects populate hands back are discarded here: the caller's free list
- * already accounts for every frame. */
-int  pio_mempool_new(const char *name, void *vaddr, uint64_t iova, uint32_t n,
+ * already accounts for every frame.
+ *
+ * The mempool is populated by virtual address in runs of page_size, so each
+ * mbuf carries the address the NIC really has for its buffer whether that is
+ * the virtual address (an IOMMU, or a bifurcated card) or a physical one (no
+ * IOMMU, as on EC2). It then checks a sample of them against the kernel's own
+ * map and refuses if the two disagree. */
+int  pio_mempool_new(const char *name, void *vaddr, uint64_t page_size, uint32_t n,
 		     uint32_t frame_size, uint32_t ring_size, int socket,
 		     void **mp, struct pio_pool **pool, char *err, size_t errlen);
 int  pio_mempool_free(void *mp, struct pio_pool *pool);

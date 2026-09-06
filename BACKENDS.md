@@ -168,7 +168,12 @@ Two rules, and they are not negotiable:
 
 - **Refuse, never widen.** A match this backend cannot express is
   `ErrUnsupported` at Open. A filter that delivers more than it was asked for
-  is indistinguishable, downstream, from one that works.
+  is indistinguishable, downstream, from one that works. The one carve-out is
+  a promiscuous filter on a driver with no promiscuous mode, on a device the
+  process owns outright: the port's own address filter is then the only gate
+  and there is nothing behind it to widen for, so `dpdk` accepts it and says
+  so in `Info.Promiscuous`. On a device shared with the kernel the same driver
+  is refused, because there promiscuous means taking the kernel's traffic.
 - **Only a backend that steers takes a SteeringFilter.** It means "the kernel
   does not see what I take". AF_PACKET cannot deliver that - it is a tap, and
   the kernel sees everything - so it has no steering option at all rather than

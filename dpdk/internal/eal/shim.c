@@ -15,6 +15,7 @@
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 #include <rte_memzone.h>
+#include <rte_memory.h>
 #include <rte_malloc.h>
 #include <rte_dev.h>
 #include <rte_flow.h>
@@ -22,6 +23,7 @@
 #include <rte_version.h>
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -122,13 +124,47 @@ static int ring_init(struct pio_ring *r, uint32_t size, int socket)
 	return 0;
 }
 
-int pio_mempool_new(const char *name, void *vaddr, uint64_t iova, uint32_t n,
+/* The address check run over a fresh mempool: see pio_mempool_new. */
+struct iova_check {
+	uint64_t page;      /* the page size the region was populated with */
+	uint32_t n;         /* objects in the pool */
+	uint32_t bad;       /* index of the first object that failed, plus one */
+	void *addr;         /* what that object's buf_addr said */
+	uint64_t claimed;   /* what its buf_iova said */
+	uint64_t actual;    /* what the kernel says that address maps to */
+};
+
+static void check_iova(struct rte_mempool *mp, void *arg, void *obj, unsigned idx)
+{
+	struct iova_check *c = arg;
+	struct rte_mbuf *m = obj;
+	uint64_t frame = (uintptr_t)obj - mp->header_size;
+	rte_iova_t real;
+
+	if (c->bad)
+		return;
+	/* The first frame of every page and the last frame of the pool. An IOVA
+	 * is linear within a page, so one look per page proves the lot, and
+	 * each look is a read of /proc/self/pagemap in PA mode. */
+	if ((frame & (c->page - 1)) != 0 && idx != c->n - 1)
+		return;
+	real = rte_mem_virt2iova(m->buf_addr);
+	if (m->buf_addr != (char *)m + sizeof(struct rte_mbuf) || m->buf_iova != real) {
+		c->bad = idx + 1;
+		c->addr = m->buf_addr;
+		c->claimed = m->buf_iova;
+		c->actual = real;
+	}
+}
+
+int pio_mempool_new(const char *name, void *vaddr, uint64_t page_size, uint32_t n,
 		    uint32_t frame_size, uint32_t ring_size, int socket,
 		    void **mp_out, struct pio_pool **pool_out, char *err, size_t errlen)
 {
 	struct rte_mempool *mp;
 	struct rte_pktmbuf_pool_private priv;
 	struct pio_pool *pool;
+	struct iova_check chk;
 	uint32_t elt_size;
 	int rc;
 
@@ -182,21 +218,61 @@ int pio_mempool_new(const char *name, void *vaddr, uint64_t iova, uint32_t n,
 	priv.mbuf_priv_size = 0;
 	rte_pktmbuf_pool_init(mp, &priv);
 
-	rc = rte_mempool_populate_iova(mp, vaddr, iova, (size_t)n * frame_size, NULL, NULL);
+	/* Populate by virtual address, a page at a time. The library asks the
+	 * environment what each page's IOVA is and hands the mempool one chunk
+	 * per run of contiguous ones: a single chunk where IOVA is VA, and as
+	 * many as the pages need where the NIC uses physical addresses, which
+	 * is what an EC2 instance with no IOMMU does. The one thing the frames
+	 * need from the memzone is to be contiguous in this process's address
+	 * space, and that a memzone always is.
+	 *
+	 * This used to be rte_mempool_populate_iova with the region's virtual
+	 * address passed as its IOVA. Every mbuf then carried a VA where the NIC
+	 * expected an address it could DMA to -- right by coincidence wherever
+	 * IOVA is VA, and on an ENA in PA mode a card writing zero-length
+	 * silence into the wrong physical pages. */
+	rc = rte_mempool_populate_virt(mp, vaddr, (size_t)n * frame_size, (size_t)page_size,
+				       NULL, NULL);
 	if (rc < 0) {
 		rte_mempool_free(mp);
 		pio_mempool_free(NULL, pool);
-		return failf(err, errlen, "rte_mempool_populate_iova(%s): %d (%s)", name, rc,
+		return failf(err, errlen, "rte_mempool_populate_virt(%s): %d (%s)", name, rc,
 			     rte_strerror(-rc));
 	}
 	if ((uint32_t)rc != n) {
 		rte_mempool_free(mp);
 		pio_mempool_free(NULL, pool);
-		return failf(err, errlen, "%s took %d objects of the %u it was given room for",
-			     name, rc, n);
+		return failf(err, errlen, "%s took %d objects of the %u it was given room for: "
+			     "a frame straddles a %" PRIu64 "-byte page", name, rc, n, page_size);
 	}
 	/* Bind every mbuf to the data buffer that follows it, once and for all. */
 	rte_mempool_obj_iter(mp, rte_pktmbuf_init, NULL);
+
+	/* Then check what the mbufs were given. Each sampled buf_iova is
+	 * compared with rte_mem_virt2iova of its own buffer -- the same source
+	 * populate drew on, so this is not an independent map; what it proves
+	 * is that no step between populate and rte_pktmbuf_init handed a frame
+	 * the wrong address, which is exactly the bug this replaced (a virtual
+	 * address passed off as the IOVA). Get that wrong and the card reads
+	 * and writes memory that is not the region, and the only symptom is
+	 * counters that advance while every frame stays empty. That is not a
+	 * failure to discover on the wire. */
+	memset(&chk, 0, sizeof(chk));
+	chk.page = page_size;
+	chk.n = n;
+	rte_mempool_obj_iter(mp, check_iova, &chk);
+	if (chk.bad) {
+		uint32_t i = chk.bad - 1;
+		void *addr = chk.addr;
+		uint64_t claimed = chk.claimed, actual = chk.actual;
+		rte_mempool_free(mp);
+		pio_mempool_free(NULL, pool);
+		return failf(err, errlen, "%s: frame %u's buffer at %p is addressed by the NIC as "
+			     "%#" PRIx64 " but maps to %#" PRIx64 " (IOVA mode %s, %" PRIu64
+			     "-byte pages); refusing to run with memory the device cannot see",
+			     name, i, addr, claimed, actual,
+			     rte_eal_iova_mode() == RTE_IOVA_PA ? "PA" : "VA", page_size);
+	}
 
 	/* Populate handed every object to our enqueue, so they are all sitting
 	 * in the returned ring. The caller's free list already accounts for
@@ -496,10 +572,11 @@ int pio_eal_close(uint16_t port, char *err, size_t errlen)
 int pio_promiscuous(uint16_t port, int on, char *err, size_t errlen)
 {
 	int rc = on ? rte_eth_promiscuous_enable(port) : rte_eth_promiscuous_disable(port);
-	if (rc != 0 && rc != -ENOTSUP)
-		return failf(err, errlen, "promiscuous mode on port %u: %d", port, rc);
 	if (rc == -ENOTSUP)
-		return failf(err, errlen, "this device cannot be put in promiscuous mode");
+		return PIO_ENOTSUP;
+	if (rc != 0)
+		return failf(err, errlen, "promiscuous mode on port %u: %d (%s)", port, rc,
+			     rte_strerror(-rc));
 	return 0;
 }
 
@@ -518,17 +595,26 @@ int pio_link_status(uint16_t port, int *up, uint32_t *speed_mbps)
 /* -------------------------------------------------------------- the memory */
 
 int pio_region_reserve(const char *name, size_t size, size_t align, int socket,
-		       void **addr, uint64_t *iova, char *err, size_t errlen)
+		       void **addr, uint64_t *page_size, char *err, size_t errlen)
 {
 	const struct rte_memzone *mz;
 
-	mz = rte_memzone_reserve_aligned(name, size, socket, RTE_MEMZONE_IOVA_CONTIG, align);
+	/* Contiguous in this process's address space, which every memzone is;
+	 * not RTE_MEMZONE_IOVA_CONTIG. Where the NIC uses physical addresses
+	 * that flag asks for the whole region on physically adjacent pages,
+	 * which sixteen megabytes of 2 MB pages rarely are, and nothing here
+	 * needs it: the mempools are populated a page at a time. */
+	mz = rte_memzone_reserve_aligned(name, size, socket, 0, align);
+	if (!mz && rte_errno == EEXIST)
+		return failf(err, errlen, "the frame memory for this port already exists: "
+			     "is the device already open in this process?");
 	if (!mz)
 		return failf(err, errlen, "reserving %zu bytes of frame memory: %s "
-			     "(are hugepages reserved, and is the memory IOVA-contiguous?)",
-			     size, rte_strerror(rte_errno));
+			     "(are enough hugepages reserved? %zu MB are needed, and a device "
+			     "addressing memory physically cannot run without them)",
+			     size, rte_strerror(rte_errno), (size + (1 << 20) - 1) >> 20);
 	*addr = mz->addr;
-	*iova = mz->iova;
+	*page_size = mz->hugepage_sz;
 	return 0;
 }
 

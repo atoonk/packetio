@@ -21,6 +21,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
@@ -52,6 +53,8 @@ type config struct {
 	devargs   string
 	frameSize int
 	verify    bool
+	dump      int
+	mtu       int
 }
 
 func main() {
@@ -75,6 +78,8 @@ func main() {
 		devargs   = flag.String("devargs", "", "extra driver arguments")
 		frameSize = flag.Int("frame-size", 0, "bytes per frame; 0 is the backend's default. Some drivers need more room for a packet than that leaves")
 		noHuge    = flag.Int("no-huge", 0, "run on ordinary memory with this many megabytes, for a vdev")
+		dump      = flag.Int("dump", 0, "print the first N packets as hex, to see that what arrives is what was sent")
+		mtu       = flag.Int("mtu", 0, "MTU to configure the port for; 0 is the backend's default. A jumbo MTU needs a frame to fit it, so raise -frame-size with it")
 	)
 	flag.Parse()
 
@@ -87,6 +92,7 @@ func main() {
 		dev: *dev, iface: *iface, queues: *queues, depth: *depth, batch: *batch,
 		noAff: *noAff, dur: *duration, report: *report, ghz: *ghz,
 		csum: *csum || *verify, devargs: *devargs, frameSize: *frameSize, verify: *verify,
+		dump: *dump, mtu: *mtu,
 	}
 	if c.iface == "" && !strings.Contains(*dev, ":") && !strings.HasPrefix(*dev, "net_") {
 		c.iface = *dev
@@ -152,6 +158,9 @@ func run(c config, vlan, dstPort int, promisc bool, noHuge int) error {
 	}
 	if c.frameSize > 0 {
 		opts = append(opts, dpdk.WithFrameSize(c.frameSize))
+	}
+	if c.mtu > 0 {
+		opts = append(opts, dpdk.WithMTU(c.mtu))
 	}
 	if noHuge > 0 {
 		opts = append(opts, dpdk.WithoutHugePages(noHuge))
@@ -248,6 +257,9 @@ func worker(ctx context.Context, dev *dpdk.Device, index int, c config, good *co
 			}
 		}
 		descs := q.Receive(c.batch)
+		if c.dump > 0 {
+			dumpPackets(dev, descs, c.dump)
+		}
 		if c.verify {
 			var ok uint64
 			for _, d := range descs {
@@ -259,6 +271,23 @@ func worker(ctx context.Context, dev *dpdk.Device, index int, c config, good *co
 		}
 		q.Recycle(descs)
 		q.Fill(q.NumFreeFillSlots())
+	}
+}
+
+// dumped counts the packets printed so far across every worker.
+var dumped atomic.Int64
+
+// dumpPackets prints packets as hex until n have been printed. Its purpose is
+// the check nothing else here makes: that the bytes are the bytes. A device
+// addressing memory it cannot see reports every length correctly and delivers
+// silence, and only looking tells the two apart.
+func dumpPackets(dev *dpdk.Device, descs []packetio.Desc, n int) {
+	for _, d := range descs {
+		i := dumped.Add(1)
+		if i > int64(n) {
+			return
+		}
+		fmt.Printf("packet %d: %d bytes\n%s", i, d.Len, hex.Dump(dev.Region().Frame(d)))
 	}
 }
 

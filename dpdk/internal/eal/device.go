@@ -9,6 +9,7 @@ package eal
 import "C"
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -243,6 +244,10 @@ func Close(p Port) error {
 	return nil
 }
 
+// ErrNoPromiscuous is what Promiscuous returns from a driver that has no such
+// mode at all, as distinct from one that has it and refused.
+var ErrNoPromiscuous = errors.New("this driver has no promiscuous mode")
+
 // Promiscuous asks the port to take every packet it sees.
 func Promiscuous(p Port, on bool) error {
 	var (
@@ -254,6 +259,9 @@ func Promiscuous(p Port, on bool) error {
 		v = 1
 	}
 	onEAL(func() { rc = C.pio_promiscuous(C.uint16_t(p), v, &errbuf[0], errLen) })
+	if rc == C.PIO_ENOTSUP {
+		return ErrNoPromiscuous
+	}
 	if rc != 0 {
 		return cerr(&errbuf[0], "port %d", p)
 	}
@@ -321,19 +329,26 @@ func PortStats(p Port) (Stats, error) {
 
 // ------------------------------------------------------------------ memory
 
-// Region is the frame memory: one memzone, as a Go slice and as the address the
-// NIC knows it by.
+// Region is the frame memory: one memzone, as a Go slice and as the address
+// this process knows it by.
+//
+// There is deliberately no IOVA here. The address the NIC uses for a frame is
+// the mbuf's business, written into it when the mempool is populated, and where
+// the NIC addresses memory physically there is one per page rather than one
+// per region. PageSize is how big those pages are.
 type Region struct {
-	Bytes []byte
-	VA    uint64
-	name  string
+	Bytes    []byte
+	VA       uint64
+	PageSize uint64
+	name     string
 }
 
-// ReserveRegion takes one IOVA-contiguous memzone of size bytes.
+// ReserveRegion takes one memzone of size bytes, contiguous in this process's
+// address space.
 func ReserveRegion(name string, size, align, socket int) (*Region, error) {
 	var (
 		addr   unsafe.Pointer
-		iova   C.uint64_t
+		page   C.uint64_t
 		errbuf [errLen]C.char
 		rc     C.int
 	)
@@ -341,15 +356,16 @@ func ReserveRegion(name string, size, align, socket int) (*Region, error) {
 	defer C.free(unsafe.Pointer(c))
 	onEAL(func() {
 		rc = C.pio_region_reserve(c, C.size_t(size), C.size_t(align), C.int(socket),
-			&addr, &iova, &errbuf[0], errLen)
+			&addr, &page, &errbuf[0], errLen)
 	})
 	if rc != 0 {
 		return nil, fmt.Errorf("%w%s", cerr(&errbuf[0], "frame memory"), logHint())
 	}
 	return &Region{
-		Bytes: unsafe.Slice((*byte)(addr), size),
-		VA:    uint64(uintptr(addr)),
-		name:  name,
+		Bytes:    unsafe.Slice((*byte)(addr), size),
+		VA:       uint64(uintptr(addr)),
+		PageSize: uint64(page),
+		name:     name,
 	}, nil
 }
 
@@ -412,7 +428,7 @@ func NewMempool(name string, r *Region, firstFrame, frames, frameSize, ringSize,
 	off := firstFrame * frameSize
 	addr := unsafe.Pointer(&r.Bytes[off])
 	onEAL(func() {
-		rc = C.pio_mempool_new(c, addr, C.uint64_t(r.VA+uint64(off)),
+		rc = C.pio_mempool_new(c, addr, C.uint64_t(r.PageSize),
 			C.uint32_t(frames), C.uint32_t(frameSize), C.uint32_t(ringSize),
 			C.int(socket), &mp, &pool, &errbuf[0], errLen)
 	})

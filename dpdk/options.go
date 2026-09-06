@@ -196,6 +196,12 @@ func WithSteering(f packetio.SteeringFilter) Option {
 }
 
 // WithPromiscuous asks the port to take every packet it sees.
+//
+// Whether it did is [Info.Promiscuous]. A driver with no promiscuous mode at
+// all is accepted on a device this process owns outright -- the ENA on EC2 --
+// since the port's own address filter is then the only thing in the way and
+// nothing else was going to arrive; on a device shared with the kernel it is
+// [packetio.ErrUnsupported].
 func WithPromiscuous() Option { return func(c *config) { c.promisc = true } }
 
 // WithChecksumOffload asks the NIC to verify checksums on receive and compute
@@ -218,8 +224,10 @@ func WithTSO() Option { return func(c *config) { c.tso = true; c.checksums = tru
 // WithoutHugePages runs the environment on ordinary memory.
 //
 // It is for a virtual device on a machine with no hugepages reserved -- a test
-// over a veth pair, say. A real NIC wants hugepages: without them the region is
-// unlikely to be physically contiguous and the reservation will fail.
+// over a veth pair, say. A real NIC wants hugepages: ordinary memory is neither
+// pinned nor mapped for a device to reach, and where the device addresses
+// memory physically -- no IOMMU, as on EC2 -- the environment refuses to start
+// without them.
 func WithoutHugePages(megabytes int) Option {
 	return func(c *config) { c.noHuge, c.memoryMB = true, megabytes }
 }

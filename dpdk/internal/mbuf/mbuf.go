@@ -165,6 +165,10 @@ func SetBuffer(b []byte, m int, addr, iova uint64, bufLen uint16) {
 // bytes it may use.
 func BufAddr(b []byte, m int) uint64 { return binary.NativeEndian.Uint64(b[m+offBufAddr:]) }
 
+// BufIOVA is the address the NIC has for the same buffer: the virtual address
+// where IOVA is VA, a physical one where it is not.
+func BufIOVA(b []byte, m int) uint64 { return binary.NativeEndian.Uint64(b[m+offBufIOVA:]) }
+
 // BufLen is how many bytes of the data buffer the NIC may fill.
 func BufLen(b []byte, m int) uint16 { return binary.NativeEndian.Uint16(b[m+offBufLen:]) }
 

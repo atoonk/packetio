@@ -15,6 +15,7 @@ import (
 
 	"github.com/atoonk/packetio"
 	"github.com/atoonk/packetio/dpdk"
+	"github.com/atoonk/packetio/dpdk/internal/mbuf"
 )
 
 func needRoot(t *testing.T) {
@@ -46,7 +47,8 @@ func TestOpenCloseManyTimes(t *testing.T) {
 }
 
 // Close is idempotent, and a device that never finished opening is closed by
-// the same path.
+// the same path: its memory is released and the port is left for the next
+// Open to find.
 func TestCloseTwiceAndHalfOpen(t *testing.T) {
 	needRoot(t)
 	d, err := open(t)
@@ -485,3 +487,184 @@ func min(a, b int) int {
 }
 
 var _ = fmt.Sprint
+
+// An Open that gives up before the port's queues exist leaves the port as it
+// found it -- probed, and configured if it got that far -- rather than closing
+// it. Closing such a port is a fault in some drivers (the ENA walks a queue
+// table with nothing in it), and there is nothing in it to close. What matters
+// is that the next Open finds the port again and that doing this in a loop
+// leaks neither ports nor memory.
+func TestFailedOpenLeavesDeviceReopenable(t *testing.T) {
+	needRoot(t)
+	const rounds = 50
+	for i := 0; i < rounds; i++ {
+		// A 9000-byte MTU cannot fit a 2048-byte frame: refused after the
+		// port is probed and before it is configured.
+		if _, err := open(t, dpdk.WithMTU(9000), dpdk.WithFrameSize(2048)); err == nil {
+			t.Fatalf("round %d: an MTU larger than the frame was accepted", i)
+		}
+		d, err := open(t)
+		if err != nil {
+			t.Fatalf("round %d: opening after a failed open: %v", i, err)
+		}
+		d.Close()
+	}
+}
+
+// Every mbuf carries the address the NIC has for its buffer. Where the NIC
+// addresses memory by virtual address that is the buffer's own address; where
+// it does not, it is whatever the page maps to, which Open checks against the
+// kernel's map before handing the device over. This test covers the first
+// case, which is the only one a machine without a device in PA mode can see,
+// and it would have caught the region's virtual address being passed off as
+// its IOVA -- which is right only by coincidence, and only in this mode.
+func TestMbufIOVAMatchesMode(t *testing.T) {
+	needRoot(t)
+	d, err := open(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	info := d.Info()
+	region := d.Region().Bytes()
+	const objHeader, mbufSize = 64, 128
+	checked := 0
+	for f := 0; f < info.Frames; f++ {
+		m := f*info.FrameSize + objHeader
+		buf := info.RegionVA + uint64(m+mbufSize)
+		if got := mbuf.BufAddr(region, m); got != buf {
+			t.Fatalf("frame %d: buf_addr %#x, want %#x", f, got, buf)
+		}
+		iova := mbuf.BufIOVA(region, m)
+		switch info.IOVAMode {
+		case "virtual":
+			if iova != buf {
+				t.Fatalf("frame %d: buf_iova %#x, want the buffer's own address %#x", f, iova, buf)
+			}
+		case "physical":
+			// Open has already checked a sample against /proc/self/pagemap;
+			// what is left to assert is that nobody wrote a virtual address.
+			if iova == buf {
+				t.Fatalf("frame %d: buf_iova is the virtual address %#x in physical mode", f, iova)
+			}
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatal("no frames to check")
+	}
+}
+
+// Info says whether the port is promiscuous, and the steering text agrees.
+func TestPromiscuousIsReported(t *testing.T) {
+	needRoot(t)
+	d, err := open(t, dpdk.WithPromiscuous())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	i := d.Info()
+	switch {
+	case i.Promiscuous && i.Steering != "every packet the port sees":
+		t.Errorf("promiscuous, but steering says %q", i.Steering)
+	case !i.Promiscuous && !strings.Contains(i.Steering, "no promiscuous mode"):
+		t.Errorf("not promiscuous after asking, and steering says %q", i.Steering)
+	}
+}
+
+// A failure after the port is configured but before its queues all exist --
+// a ring depth the driver refuses is the easiest to provoke -- is the case
+// that crashed on the ENA: Close walked into a queue table with nothing in
+// it. The port is left configured instead, and the next Open must be able to
+// take it over. Drivers that accept a 32768-deep ring cannot show it and skip.
+func TestQueueSetupFailureLeavesDeviceReopenable(t *testing.T) {
+	needRoot(t)
+	d, err := open(t, dpdk.WithRxDepth(1<<15), dpdk.WithFrames(1<<16))
+	if err == nil {
+		d.Close()
+		t.Skip("this driver takes a 32768-deep receive ring, so queue setup cannot be made to fail")
+	}
+	if !strings.Contains(err.Error(), "receive queue") {
+		t.Skipf("Open failed before queue setup, which is not the case under test: %v", err)
+	}
+	t.Logf("the failure, for the record: %v", err)
+	d, err = open(t)
+	if err != nil {
+		t.Fatalf("opening after queue setup failed: %v", err)
+	}
+	d.Close()
+}
+
+// The same thing where it can be made to happen on any machine: the af_packet
+// driver refuses a receive queue whose frame cannot hold its ring frame, and
+// it does so after the port is configured. The default frame is too small, a
+// 4096-byte one is not, so the second Open of the same port has to work.
+func TestQueueSetupFailureOverVeth(t *testing.T) {
+	name, _ := vethPair(t)
+	dev := "net_af_packet2,iface=" + name
+	opts := []dpdk.Option{dpdk.WithoutHugePages(256), dpdk.WithTxQueues(1), dpdk.WithRxQueues(1),
+		dpdk.WithFrames(1024), dpdk.WithTxDepth(256), dpdk.WithRxDepth(256)}
+	for round := 0; round < 3; round++ {
+		// The failing Open asks for promiscuous mode, which is granted before
+		// the port is configured. The half-open Close has to take it back:
+		// otherwise the port keeps it, the next start replays it, and the
+		// next Open takes everything while saying it takes nothing.
+		_, err := dpdk.Open(dev, append(opts, dpdk.WithPromiscuous())...)
+		if err == nil {
+			t.Fatalf("round %d: af_packet took a 2048-byte frame, which it never has", round)
+		}
+		if !strings.Contains(err.Error(), "receive queue") {
+			t.Fatalf("round %d: failed somewhere other than queue setup: %v", round, err)
+		}
+		if promiscuous(t, name) {
+			t.Fatalf("round %d: %s is still promiscuous after a failed Open", round, name)
+		}
+		d, err := dpdk.Open(dev, append(opts, dpdk.WithFrameSize(4096))...)
+		if err != nil {
+			t.Fatalf("round %d: opening after queue setup failed: %v", round, err)
+		}
+		if d.Info().Promiscuous || promiscuous(t, name) {
+			t.Fatalf("round %d: promiscuous mode leaked into an Open that did not ask for it", round)
+		}
+		d.Close()
+	}
+}
+
+// promiscuous reports whether the kernel has an interface in promiscuous mode:
+// what the af_packet driver's promiscuous mode really is.
+func promiscuous(t *testing.T, iface string) bool {
+	t.Helper()
+	out, err := exec.Command("ip", "-o", "link", "show", iface).CombinedOutput()
+	if err != nil {
+		t.Fatalf("ip link show %s: %v: %s", iface, err, out)
+	}
+	return strings.Contains(string(out), "PROMISC")
+}
+
+// vethPair makes a veth pair for a test that needs a real interface, and
+// skips the test where it may not.
+func vethPair(t *testing.T) (name, peer string) {
+	t.Helper()
+	needRoot(t)
+	if os.Getenv("PACKETIO_VETH_TESTS") == "" {
+		t.Skip("set PACKETIO_VETH_TESTS=1 to allow this test to create veth interfaces")
+	}
+	if os.Getenv("PACKETIO_DPDK_DEV") != "" || os.Getenv("PACKETIO_IFACE") != "" {
+		t.Skip("this test opens its own device, and the environment is pinned to another")
+	}
+	name = "pioq" + strconv.Itoa(os.Getpid()%1000)
+	peer = name + "p"
+	if out, err := exec.Command("ip", "link", "add", name, "type", "veth",
+		"peer", "name", peer).CombinedOutput(); err != nil {
+		t.Skipf("cannot create a veth pair: %v: %s", err, out)
+	}
+	t.Cleanup(func() { exec.Command("ip", "link", "del", name).Run() })
+	for _, n := range []string{name, peer} {
+		exec.Command("sysctl", "-qw", "net.ipv6.conf."+n+".disable_ipv6=1").Run()
+		if out, err := exec.Command("ip", "link", "set", n, "up").CombinedOutput(); err != nil {
+			t.Skipf("cannot bring %s up: %v: %s", n, err, out)
+		}
+	}
+	return name, peer
+}

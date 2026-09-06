@@ -43,7 +43,8 @@ This is the DPDK you have read about. The device leaves the kernel entirely.
 
 ```bash
 ls /sys/class/iommu/                      # must not be empty; if it is, enable
-                                          # IOMMU in BIOS + kernel cmdline
+                                          # IOMMU in BIOS + kernel cmdline, or
+                                          # see EC2.md: no IOMMU is normal there
 sudo sysctl -w vm.nr_hugepages=64         # ~128 MB is plenty
 sudo modprobe vfio-pci
 sudo ip link set eno2 down
@@ -64,6 +65,12 @@ you trust a `ping`.
 
 `dpdk-devbind.py --status` lists devices and their drivers. `Capabilities()
 .KernelCoexistence` tells your program which world it is in.
+
+### EC2, or anything else without an IOMMU
+
+The exclusive path with `vfio-pci` in no-IOMMU mode, physical addressing and
+mandatory hugepages. The bind sequence, the VPC's rules about source addresses,
+and what an ENA does not offer are in [EC2.md](EC2.md).
 
 ## Open it
 

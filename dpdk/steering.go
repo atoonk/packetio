@@ -3,6 +3,7 @@
 package dpdk
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -169,16 +170,16 @@ func open(devargs string) (eal.Port, error) {
 // packetio.Rule, each a conjunction, a packet matching any of them arriving.
 func (d *Device) steeringRules(ifname string) ([]eal.Match, error) {
 	f := d.cfg.steering
-	if !f.Promiscuous && len(f.Match) == 0 {
-		d.info.Steering = d.describeDefault()
-		return nil, nil
-	}
-	if f.Promiscuous {
-		// Nothing to match: the port is asked to take everything instead.
-		if err := eal.Promiscuous(d.port, true); err != nil {
-			return nil, fmt.Errorf("%w: %v", packetio.ErrUnsupported, err)
+	if f.Promiscuous || d.cfg.promisc {
+		if err := d.setPromiscuous(); err != nil {
+			return nil, err
 		}
-		d.info.Steering = "every packet the port sees"
+	}
+	if f.Promiscuous || len(f.Match) == 0 {
+		// Nothing to match: the port takes everything it is given.
+		if !f.Promiscuous && !d.cfg.promisc {
+			d.info.Steering = d.describeDefault()
+		}
 		return nil, nil
 	}
 
@@ -240,10 +241,32 @@ func (d *Device) steeringRules(ifname string) ([]eal.Match, error) {
 	return out, nil
 }
 
-func (d *Device) describeDefault() string {
-	if d.cfg.promisc {
-		return "every packet the port sees"
+// setPromiscuous asks the port for every packet it sees, and records what it
+// got.
+//
+// A driver with no promiscuous mode at all is not a refusal on a device this
+// process owns outright: the port's own address filter is then the only thing
+// in the way, there is nothing behind it to widen the filter for, and the
+// queues get exactly what a promiscuous port would have got. The ENA on EC2 is
+// such a driver. On a device shared with the kernel
+// promiscuous means taking the kernel's traffic too, which a driver without
+// the mode genuinely cannot do, so there it stays an error.
+func (d *Device) setPromiscuous() error {
+	err := eal.Promiscuous(d.port, true)
+	switch {
+	case err == nil:
+		d.info.Promiscuous = true
+		d.info.Steering = "every packet the port sees"
+	case errors.Is(err, eal.ErrNoPromiscuous) && !d.info.Coexists:
+		d.info.Steering = "whatever the port's own address filter admits " +
+			"(this driver has no promiscuous mode to widen it)"
+	default:
+		return fmt.Errorf("%w: %v", packetio.ErrUnsupported, err)
 	}
+	return nil
+}
+
+func (d *Device) describeDefault() string {
 	if d.cfg.rxQueues == 0 {
 		return "nothing: this device does not receive"
 	}

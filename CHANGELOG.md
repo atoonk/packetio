@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased
+
+**dpdk: works without an IOMMU -- EC2's ENA, physical addressing, 2 MB
+pages.** Every mbuf's `buf_iova` was the region's *virtual* address: the
+mempool was populated with the region's VA passed off as its IOVA, which is
+right wherever the NIC addresses memory virtually (behind an IOMMU, or
+bifurcated) and on an ENA in IOVA=PA mode made the card DMA to physical
+addresses that were never the region -- counters advancing, every received
+frame zero-filled at the right length, nothing transmitted reaching the
+wire. Mempools are now populated by virtual address a page at a time
+(`rte_mempool_populate_virt`), so each mbuf carries the address the NIC
+really has, and `Open` then checks a sample of them against
+`/proc/self/pagemap` and refuses to run if the two disagree. The region is
+no longer asked to be physically contiguous, which is what made 16 MB of
+frames fail on 2 MB hugepages (`Cannot allocate memory`); either page size
+works now. Verified on a `c6i.xlarge`: real bytes on receive, every
+transmitted frame seen by the peer, and Teraplane's dataplane answering
+pings through it. [dpdk/EC2.md](dpdk/EC2.md) is the setup.
+
+**dpdk: an Open that fails after the port is configured no longer
+segfaults in its own cleanup.** `Close` closed the port unconditionally,
+and ENA's close walks the queue table and dereferences the queues that were
+never set up (`ena_close`, address 0x28). The region and the workers'
+placement are now taken before the port is configured, so the only failures
+left in that window are queue setup itself, and a device that never got its
+queues is left probed -- possibly configured, isolation undone -- rather
+than closed or removed; the next `Open` finds it again. The original error
+is what the caller sees.
+
+**dpdk: a driver with no promiscuous mode is reported, not refused.** The
+ENA has none, and nothing in a VPC would arrive under it anyway. On a device
+this process owns outright, `Promiscuous: true` and `WithPromiscuous()` are
+accepted, `Info.Promiscuous` says what happened and `Info.Steering` says
+why. On a device shared with the kernel it stays `ErrUnsupported`, since
+there promiscuous means taking the kernel's traffic.
+
+`examples/dpdk/drop -dump N` prints the first N packets as hex -- the one
+check the counters cannot make.
+
+**afpacket: jumbo frames without GSO.** `WithFrameSize` above 2048 was
+refused unless `WithGSO` was set, on the belief that the ring's 2048-byte
+frame capped a packet. It caps nothing: TPACKET_V3 delivers packets up to
+its 64 KiB block, and Receive copies into the region frame anyway. The
+ceiling without GSO is now the block, so `WithFrameSize(16384)` carries a
+9000-byte MTU whole -- verified over a veth pair at MTU 9000.
+
+**afxdp: Capabilities tell the truth about multi-buffer and frame size.**
+Both are now read off the socket (go-afxdp v0.11.2's `Socket.MultiBuffer`
+and `Socket.MaxPacket`), so `Capabilities.MultiBuffer` is true however
+multi-buffer was asked for -- the new `afxdp.WithMultiBuffer`, `WithXDP`, or
+a fleet handed to `NewDevice` -- and `MaxFrameSize` is the largest packet a
+frame receives: the frame less the 256 bytes of XDP_PACKET_HEADROOM the
+kernel keeps in front of every packet it writes, not the frame itself.
+
 ## v0.1.0
 
 **afxdp: small fleets get the fast transmit descriptors - +20-30% on

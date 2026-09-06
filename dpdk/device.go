@@ -79,7 +79,12 @@ type Device struct {
 
 	closeMu sync.Mutex
 	closed  bool
-	started bool
+	// How far Open got, which is how far Close has to go back. A port whose
+	// queues were never all set up is left probed, its isolation and
+	// promiscuous mode undone: see Close.
+	isolated bool
+	ready    bool
+	started  bool
 }
 
 // Info describes an open device.
@@ -122,8 +127,15 @@ type Info struct {
 	// card's per-send-queue drain rate is the limit.
 	RingsPerQueue int
 
-	// Steering describes what the receive queues were told to take.
-	Steering string
+	// Steering describes what the receive queues were told to take, and
+	// Promiscuous whether the port was put in promiscuous mode to do it.
+	//
+	// Promiscuous can be false after asking for it. A driver with no such
+	// mode -- the ENA on EC2 is one -- is accepted when this process owns the
+	// device outright, because the port's own address filter is then the only
+	// thing between the wire and the queues and there is nothing to widen.
+	Steering    string
+	Promiscuous bool
 
 	// Placement describes where this device's workers will be put.
 	Placement string
@@ -134,9 +146,11 @@ type Info struct {
 	LinkUp    bool
 	SpeedMbps uint32
 
-	// RegionVA is the address the NIC knows the frame memory by, and IOVAMode
-	// how it addresses memory at all. Both are the first things to check when
-	// a frame does not arrive.
+	// RegionVA is the address this process knows the frame memory by: every
+	// descriptor is an offset from it. IOVAMode is how the NIC addresses the
+	// same memory -- "virtual" behind an IOMMU or on a bifurcated card,
+	// "physical" where there is no IOMMU, as on EC2. Both are the first things
+	// to check when a frame does not arrive.
 	RegionVA uint64
 	IOVAMode string
 }
@@ -242,10 +256,11 @@ func Open(name string, opts ...Option) (d *Device, err error) {
 	// The device handle is taken now, while the port still exists: closing the
 	// port releases its id and with it the only route back to the device.
 	d = &Device{port: port, handle: eal.Handle(port), cfg: cfg}
-	// Anything that fails from here leaves nothing behind: a half-open device
-	// holds a memzone, a port and possibly hugepages. The cleanup holds its own
-	// reference, because returning "nil, err" clears the named result before
-	// the deferred function runs.
+	// Anything that fails from here leaves nothing behind that the next Open
+	// cannot take over: the memzone and mempools are freed, and the port is
+	// left as Close describes. The cleanup holds its own reference, because
+	// returning "nil, err" clears the named result before the deferred
+	// function runs.
 	half := d
 	defer func() {
 		if err != nil {
@@ -294,6 +309,23 @@ func Open(name string, opts ...Option) (d *Device, err error) {
 		IOVAMode: iovaName(eal.IOVAMode()),
 	}
 
+	// The memory comes before the port is touched: it needs nothing from the
+	// port but its memory node, and everything that can go wrong with it --
+	// too few hugepages, above all -- then goes wrong while the port is still
+	// only probed and there is nothing to undo.
+	if d.region, err = eal.ReserveRegion(regionName(port), cfg.frames*cfg.frameSize,
+		cfg.frameSize, di.Socket); err != nil {
+		return nil, err
+	}
+	d.info.RegionVA = d.region.VA
+
+	if !cfg.noAffinity {
+		if d.place, err = affinity.New(name, cfg.affinity); err != nil {
+			return nil, fmt.Errorf("dpdk: %w", err)
+		}
+	}
+	d.info.Placement = d.place.String()
+
 	// Isolated mode has to be asked for before the port is configured, and it
 	// is what keeps the kernel's traffic reaching the kernel.
 	steer, err := d.steeringRules(name)
@@ -305,6 +337,7 @@ func Open(name string, opts ...Option) (d *Device, err error) {
 			return nil, fmt.Errorf("%w; without isolated mode this device cannot take traffic "+
 				"from the kernel safely", err)
 		}
+		d.isolated = true
 	}
 
 	var offloads uint32
@@ -330,19 +363,6 @@ func Open(name string, opts ...Option) (d *Device, err error) {
 		return nil, fmt.Errorf("dpdk: %w: this device does not offer TCP segmentation",
 			packetio.ErrUnsupported)
 	}
-
-	if d.region, err = eal.ReserveRegion(regionName(port), cfg.frames*cfg.frameSize,
-		cfg.frameSize, di.Socket); err != nil {
-		return nil, err
-	}
-	d.info.RegionVA = d.region.VA
-
-	if !cfg.noAffinity {
-		if d.place, err = affinity.New(name, cfg.affinity); err != nil {
-			return nil, fmt.Errorf("dpdk: %w", err)
-		}
-	}
-	d.info.Placement = d.place.String()
 
 	// Each queue owns a disjoint run of frames and a mempool over exactly
 	// those, so no two free lists can ever name the same frame. The division
@@ -391,12 +411,10 @@ func Open(name string, opts ...Option) (d *Device, err error) {
 	for _, q := range d.rx {
 		q.q.Fill(q.q.NumFreeFillSlots())
 	}
+	// Every queue the port was configured for now exists, which is what makes
+	// the port safe to close.
+	d.ready = true
 
-	if cfg.promisc {
-		if err := eal.Promiscuous(port, true); err != nil {
-			return nil, err
-		}
-	}
 	if err := eal.Start(port); err != nil {
 		return nil, err
 	}
@@ -616,6 +634,16 @@ func (d *Device) PortStats() (eal.Stats, error) { return eal.PortStats(d.port) }
 // mempools and the region go, and finally the device is removed from the
 // environment so the same one can be opened again.
 //
+// A device that Open gave up on part-way is treated differently: the port is
+// left probed, and configured if it got that far, with its isolation and
+// promiscuous mode undone and its memory released -- the PMD keeps a stale
+// mempool pointer in any queue it did set up, which the next Open's queue
+// setup replaces before anything reads it. Closing a port whose queues were
+// never all set up is a fault in some drivers -- ENA walks the queue table
+// and dereferences the gaps -- and
+// there is nothing in such a port worth closing. The next Open finds it again
+// and configures it afresh.
+//
 // It is safe to call twice, and safe to call while another goroutine sits in
 // Poll -- that goroutine returns ErrClosed. It is not safe to call while one is
 // part-way through Receive or Transmit.
@@ -648,8 +676,32 @@ func (d *Device) Close() error {
 		}
 		d.started = false
 	}
-	if err := eal.Close(d.port); err != nil {
-		errs = append(errs, err)
+	if d.ready {
+		if err := eal.Close(d.port); err != nil {
+			errs = append(errs, err)
+		}
+	} else {
+		// Isolation and promiscuous mode are both asked for before the port
+		// is configured and neither is reset by anything short of closing
+		// it, so a half-open Close takes them back by hand. A bifurcated
+		// port left isolated receives nothing for the kernel; a port left
+		// promiscuous is replayed as promiscuous by every start after it,
+		// and would take everything while reporting that it takes nothing.
+		if d.isolated {
+			if err := eal.Isolate(d.port, false); err != nil {
+				errs = append(errs, err)
+			}
+			d.isolated = false
+		}
+		if d.info.Promiscuous {
+			// A driver can grant the mode without having it -- the null
+			// vdev is born promiscuous, so enabling returns early and
+			// disabling reaches a missing op -- which is not a failure.
+			if err := eal.Promiscuous(d.port, false); err != nil && !errors.Is(err, eal.ErrNoPromiscuous) {
+				errs = append(errs, err)
+			}
+			d.info.Promiscuous = false
+		}
 	}
 	for _, mp := range d.pools {
 		mp.Free()
@@ -659,9 +711,13 @@ func (d *Device) Close() error {
 		errs = append(errs, err)
 	}
 	// Removing the device is what lets the same one be opened again. Without
-	// it a program that opens and closes in a loop runs out of ports.
-	if err := eal.Remove(d.handle); err != nil {
-		errs = append(errs, err)
+	// it a program that opens and closes in a loop runs out of ports. A port
+	// left half-open is not removed: removing it closes it, and Open finds a
+	// port that is still there before probing for a new one.
+	if d.ready {
+		if err := eal.Remove(d.handle); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	d.handle = nil
 	return errors.Join(errs...)
