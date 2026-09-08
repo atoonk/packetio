@@ -81,26 +81,28 @@ func (q *fakeRx) fail(err error) { q.err.Store(&err) }
 func (q *fakeRx) Region() packetio.Region { return &q.region }
 func (q *fakeRx) Fill(n int) int          { return n }
 func (q *fakeRx) Poll(timeout time.Duration) (int, error) {
-	if q.closed.Load() {
-		return 0, packetio.ErrClosed
-	}
-	if e := q.err.Load(); e != nil {
-		return 0, *e
-	}
-	if len(q.in) > 0 {
-		return len(q.in), nil
-	}
-	if timeout == 0 {
-		return 0, nil
-	}
-	select {
-	case f := <-q.in:
-		q.in <- f // put it back; Receive takes it
-		return 1, nil
-	case <-time.After(timeout):
-		return 0, nil
+	// Never take a frame off the channel to find out whether one is there:
+	// putting it back appends it, which silently reorders the queue. A test
+	// that cares about frame order (a packet spanning several frames, say)
+	// then sees a sequence nobody injected.
+	deadline := time.Now().Add(timeout)
+	for {
+		if q.closed.Load() {
+			return 0, packetio.ErrClosed
+		}
+		if e := q.err.Load(); e != nil {
+			return 0, *e
+		}
+		if n := len(q.in); n > 0 {
+			return n, nil
+		}
+		if timeout == 0 || !time.Now().Before(deadline) {
+			return 0, nil
+		}
+		time.Sleep(200 * time.Microsecond)
 	}
 }
+
 func (q *fakeRx) Receive(max int) []packetio.Desc {
 	var descs []packetio.Desc
 	for i := 0; i < max && i < fakeFrames; i++ {
