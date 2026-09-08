@@ -37,6 +37,14 @@ jobs:
           GOOS=darwin GOARCH=arm64 go build ./...
           GOOS=linux GOARCH=386 go build ./...
           GOOS=linux GOARCH=arm go build ./...
+          # The netstack module lives in this tree but not in this module:
+          # a tag that breaks it is a tag that breaks it. This is the gate on
+          # the tag, so it is at least as strict as the pull request's: the
+          # generated gVisor tree must match its pin and patches, and the
+          # tests run under the race detector.
+          (cd netstack && go build ./... && go vet . ./examples/... && go test -race ./...)
+          (cd netstack && out=$(gofmt -l .); if [ -n "$out" ]; then echo "$out"; exit 1; fi)
+          (cd netstack/gvisor && ./import.sh -check)
 
       - name: next version
         id: v

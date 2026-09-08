@@ -70,6 +70,13 @@ sudo go run -tags mlx5 ./examples/drop  -i eth0 -queues 4
 sudo go run -tags mlx5 ./examples/steer -i eth0 -udp-port 9000 -udp-port 9001
 ```
 
+## TCP/IP on top - the netstack module
+
+[`../netstack/examples/tcpecho`](../netstack/examples/tcpecho) is a TCP echo
+server and client on gVisor's stack over any of the four backends; see
+[`../netstack/README.md`](../netstack/README.md). It lives in its own module,
+so it is run from that directory.
+
 ## DPDK - `-tags dpdk`
 
 | | what it shows |

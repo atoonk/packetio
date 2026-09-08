@@ -36,3 +36,9 @@
 /blast
 /sweep
 docs/
+
+# The netstack module: a local-only workspace, if one is used, and example
+# binaries.
+/netstack/go.work
+/netstack/go.work.sum
+/netstack/examples/tcpecho/tcpecho

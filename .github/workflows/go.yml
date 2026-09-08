@@ -91,3 +91,44 @@ jobs:
         run: |
           sudo -E env "PATH=$PATH" PACKETIO_VETH_TESTS=1 PACKETIO_CONFORM_REQUIRED=1 \
             go test -tags dpdk -count=1 ./dpdk/...
+      # The netstack module's dpdk backend: DPDK's af_packet driver over a
+      # veth, no hugepages. gVisor needs a newer Go than the root module, so
+      # the go command fetches the toolchain netstack/go.mod names.
+      - name: netstack over dpdk
+        run: |
+          cd netstack
+          go build -tags dpdk ./... && go vet -tags dpdk . ./examples/...
+          sudo -E env "PATH=$PATH" PACKETIO_VETH_TESTS=1 PACKETIO_CONFORM_REQUIRED=1 \
+            go test -tags dpdk -count=1 -run /dpdk ./...
+
+  # netstack is its own module (gVisor, and its Go requirement, stay out of
+  # the root), so nothing above touches it. Its end-to-end tests run a TCP
+  # stack over a veth pair on afpacket and on AF_XDP in generic mode -- both
+  # work on a hosted runner -- with a kernel peer in a namespace.
+  netstack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: netstack/go.mod
+      # vet runs on this module's own packages: the imported gVisor tree is
+      # upstream's code, vetted upstream, and trips checks its own lint
+      # configuration turns off.
+      - name: build, vet, gofmt, unit tests
+        run: |
+          cd netstack
+          go build ./...
+          go vet . ./examples/...
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "$out"; exit 1; fi
+          go test -race ./...
+      # netstack/gvisor/pkg is generated from PIN and patches/; a tree that
+      # was edited by hand, or not regenerated after a patch changed, fails.
+      - name: the gVisor tree matches its pin and patches
+        run: cd netstack/gvisor && ./import.sh -check
+      - name: the stack over a veth, as root
+        run: |
+          cd netstack
+          sudo -E env "PATH=$PATH" GOTOOLCHAIN=local PACKETIO_VETH_TESTS=1 PACKETIO_CONFORM_REQUIRED=1 \
+            go test -race -count=1 ./...

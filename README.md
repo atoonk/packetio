@@ -336,6 +336,7 @@ sudo go run ./examples/hello -i eth0
 | [`timestamps`](examples/timestamps) | when packets really arrived, and the gaps between them | any |
 | [`pingpong`](examples/pingpong) | round trips between two machines, split by where the time went | mlx5 |
 | [`sweep`](examples/sweep) | every backend through the same three loops; the Performance tables above | mlx5, dpdk, afxdp |
+| [`netstack/examples/tcpecho`](netstack/examples/tcpecho) | a TCP echo server, and client, on a userspace TCP/IP stack over the device | any |
 
 ```bash
 sudo go run -tags mlx5 ./examples/steer -i eth0 -udp-port 9000 -udp-port 9001
@@ -345,6 +346,19 @@ There is no separate AF_XDP example because none is needed: the loop in any of
 these runs on it unchanged once you open with a steering filter, which is two
 lines shown in its [README](afxdp/). AF_XDP-specific tooling lives in
 [go-afxdp](https://github.com/atoonk/go-afxdp).
+
+## TCP on top: netstack
+
+Fast receive and transmit are only useful if something can speak the
+protocols on them. [`netstack/`](netstack) runs gVisor's TCP/IP stack over any
+packetio device and hands back `net.Listener` and `net.Conn`, so a TCP server
+-- or a client, or a load balancer that terminates connections -- runs in
+userspace with the kernel nowhere on the path. It is a separate Go module, so
+programs that only move frames do not carry gVisor, and the gVisor it carries
+is a patched one (`netstack/gvisor`, go-afxdp's ten patches on a pinned
+upstream commit, the stack that produced its numbers). Its README says which
+address to give the stack on each backend, which is the one thing that
+differs between them.
 
 ## Timestamps: how long you held a packet
 
