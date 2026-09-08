@@ -12,12 +12,16 @@ packet path crosses into C three times per *batch* - one burst each way, plus a
 poke when a transmit queue goes idle. At a batch of 64 that is under a
 nanosecond per packet.
 
+On why this backend exists and how it measures against the other three:
+[Four ways to do super fast packet processing in Go](https://toonk.io/packetio/).
+
 ## What you need
 
 - **x86-64.** The cgo layer is built for it; the build tag says `amd64`.
-- **DPDK 23.11 or later**: `apt install libdpdk-dev dpdk` on Ubuntu 24.04. The
-  poll-mode drivers are plugins loaded at startup - installing the package is
-  enough, there is nothing to compile.
+- **DPDK 23.11 or later.** To build: `apt install libdpdk-dev` on Ubuntu 24.04.
+  To *run* a binary built elsewhere: `apt install dpdk`, which is where the
+  `librte_*` libraries live. The poll-mode drivers are plugins loaded at
+  startup, so installing the package is enough and there is nothing to compile.
 - A **`-tags dpdk` build**.
 - Root, or `CAP_NET_RAW` + `CAP_IPC_LOCK` and access to `/dev/vfio`.
 
@@ -152,7 +156,7 @@ All with default options, one goroutine per queue:
 
 | | rate | cores |
 | --- | ---: | ---: |
-| transmit, one queue | 55.5 Mpps | 1 |
+| transmit, one queue | 56.7 Mpps | 1 |
 | transmit, two queues | 106.9 Mpps | 2 |
 | transmit, line rate | **148.8 Mpps** | **3** |
 | receive, one queue | **46.1 Mpps** | 1 |

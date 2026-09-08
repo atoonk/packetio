@@ -5,20 +5,32 @@ The fastest backend here, and the one that costs you the least operationally.
 The card's queue memory and doorbell register are mapped straight into your
 process. After `Open` there is no kernel in the packet path and no C library
 either: sending is writing a descriptor to memory the NIC is watching and one
-8-byte store to ring the doorbell. **67.5 Mpps on one core.**
+8-byte store to ring the doorbell. **69.2 Mpps on one core.**
 
 The kernel keeps the interface the whole time. `mlx5_core` stays bound, `eth0`
 stays up, SSH keeps working, and the card serves both of you at once - you take
 only what your steering filter names.
 
+Why Direct Verbs rather than DPDK on the same card, and what it costs:
+[Four ways to do super fast packet processing in Go](https://toonk.io/packetio/).
+
 ## What you need
 
 - A ConnectX-4 or newer / BlueField card (measured on ConnectX-6 Dx).
-- **rdma-core** at build and run time: `apt install libibverbs-dev librdmacm-dev`.
+- **rdma-core.** To build: `apt install libibverbs-dev` (Ubuntu 24.04), which
+  brings the `libibverbs` and `libmlx5` link targets. To *run* a binary built
+  elsewhere: `apt install libibverbs1 ibverbs-providers`. The backend links
+  `-libverbs -lmlx5` and nothing else.
 - A **`-tags mlx5` build** - the tag keeps cgo and rdma-core out of everyone
   else's build.
 - `CAP_NET_RAW`, and a memory lock limit big enough for the frame region
   (`ulimit -l`, or run as root).
+- `/dev/infiniband` present, which means the `mlx5_ib` module is loaded. If
+  `Open` fails before it touches the card, check this first:
+
+```bash
+ls /dev/infiniband      # uverbs0, uverbs1, ... one per port
+```
 
 ```bash
 go build -tags mlx5 ./...
@@ -58,7 +70,7 @@ One goroutine per queue is the whole model. Open as many transmit queues as
 cores you are willing to spend, give each its own goroutine, and the backend
 does the rest - descriptor mode, hardware rings behind each queue, region
 sizing, and seating each worker on a processor of its own. On a ConnectX-6 Dx
-this reaches **64-byte line rate on three cores** (148.1 Mpps); the program
+this reaches **64-byte line rate on three cores** (147.8 Mpps); the program
 below opens four for margin:
 
 ```go
@@ -83,7 +95,7 @@ for i := 0; i < d.NumTxQueues(); i++ {
 wg.Wait()
 ```
 
-Scale down the same way: one queue is 67.5 Mpps, two are 102, three are 148.
+Scale down the same way: one queue is 69.2 Mpps, two are 102, three are 148.
 [`examples/blast`](../examples/blast) is this recipe with flags, rate control
 and counters - `-queues 4` and nothing else reaches the wire.
 
@@ -113,7 +125,7 @@ Specific to this backend:
 ## Timestamps
 
 Every completion carries the card's own reading of when the frame arrived at
-the port, in 4 ns steps:
+the port, in 1 ns steps:
 
 ```go
 rx, _ := d.RxQueue(0).(packetio.TimestampReceiver)
@@ -179,8 +191,8 @@ produces. One goroutine per queue is then the right thing to write:
 
 | what you want | how | measured |
 | --- | --- | ---: |
-| the most from one core | `WithTxQueues(1)` - pointer descriptors | 67.5 Mpps |
-| 64-byte line rate | `WithQueues(3)`, one goroutine each | **148.1 Mpps, 3 cores** |
+| the most from one core | `WithTxQueues(1)` - pointer descriptors | 69.2 Mpps |
+| 64-byte line rate | `WithQueues(3)`, one goroutine each | **147.8 Mpps, 3 cores** |
 
 `WithMultiPacket` / `WithoutMultiPacket` still pick a mode explicitly, and
 `WithRingsPerQueue(n)` overrides the fan-out; `Info.RingsPerQueue` reports
@@ -194,13 +206,13 @@ All with default options, one goroutine per queue:
 
 | | rate | cores |
 | --- | ---: | ---: |
-| transmit, one queue | **67.5 Mpps** | 1 |
-| transmit, two queues | 102.3 Mpps | 2 |
-| transmit, line rate | **148.1 Mpps** | **3** |
-| receive, one queue | 46.2 Mpps | 1 |
-| receive, eight queues | 146.5 Mpps | 8 |
-| forwarding, one queue | **30.0 Mpps** | 1 |
-| forwarding, eight queues | **141.1 Mpps** | 8 |
+| transmit, one queue | **69.2 Mpps** | 1 |
+| transmit, two queues | 100.7 Mpps | 2 |
+| transmit, line rate | **148.8 Mpps** | **4** (147.8 on 3) |
+| receive, one queue | 44.1 Mpps | 1 |
+| receive, line rate | 148.6 Mpps | 10 |
+| forwarding, one queue | **29.3 Mpps** | 1 |
+| forwarding, line rate | **147.4 Mpps** | 12 |
 | forwarding, near line rate | 147.6 Mpps | 12 |
 
 At 1500-byte frames **one core saturates 100 Gbit/s**.
@@ -232,7 +244,8 @@ sudo go run -tags mlx5 ./examples/info  -i eth0
 sudo go run -tags mlx5 ./examples/blast -i eth0 -dst-mac ... -queues 4
 sudo go run -tags mlx5 ./examples/drop  -i eth0 -queues 4
 sudo go run -tags mlx5 ./examples/steer -i eth0 -udp-port 9000
-sudo go run -tags mlx5 ./examples/l3fwd -i eth0 -workers 4
+sudo go run -tags mlx5 ./examples/l3fwd -i eth0 -queues 4 \
+  -route 10.0.0.0/8,7c:c2:55:be:f3:c7
 ```
 
 [`send`](../examples/send) is the smallest one: a single frame, and what the

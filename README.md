@@ -35,10 +35,12 @@ cannot honour rather than approximating it.
 What is not traded away is performance. No per-packet allocation, no system
 call, library call or cgo call per packet on the fast path, and no copies
 anywhere the mechanism allows it: of the four backends only AF_PACKET copies,
-because a packet socket is a copy. On a ConnectX-6 Dx, three cores transmit
-64-byte line rate at 100G (about 148 Mpps) over mlx5 or DPDK, and it is a Go
-program you `go build` like any other. The [Performance](#performance) section
-has the full tables.
+because a packet socket is a copy. On a ConnectX-6 Dx, **three Go workers on
+DPDK put 64-byte frames on a 100G wire at line rate** (148.8 Mpps); Direct
+Verbs needs four, and forwards line rate on twelve. It is a Go program you
+`go build` like any other. The [Performance](#performance) section has the
+full tables, and I wrote up the whole comparison here:
+[Four ways to do super fast packet processing in Go](https://toonk.io/packetio/).
 
 ---
 
@@ -48,9 +50,27 @@ has the full tables.
 go get github.com/atoonk/packetio
 ```
 
-Nothing else, if you use the AF_XDP or AF_PACKET backends. The mlx5 backend
-needs rdma-core and a `-tags mlx5` build; DPDK needs libdpdk and a `-tags dpdk`
-build. Each backend's README has the details.
+Nothing else, if you use the AF_XDP or AF_PACKET backends: they are pure Go.
+
+The other two link C libraries, so they need a package and a build tag. On
+Ubuntu 24.04:
+
+```bash
+# mlx5 Direct Verbs
+sudo apt install libibverbs-dev            # to build
+sudo apt install libibverbs1 ibverbs-providers   # to run a binary built elsewhere
+go build -tags mlx5 ./...
+
+# DPDK
+sudo apt install libdpdk-dev               # to build
+sudo apt install dpdk                      # to run a binary built elsewhere
+go build -tags dpdk ./...
+```
+
+Both want to pin memory, so run as root or raise the memory lock limit
+(`ulimit -l`). DPDK additionally wants hugepages on a card it takes from the
+kernel, and none at all on a ConnectX, which keeps its kernel interface. Each
+backend's README has the details.
 
 ## Quick start
 
@@ -145,9 +165,9 @@ them. `Alloc` → fill → `Transmit` → `Complete` going out; `Fill` → `Poll
 
 | | use it when | needs | one core sends |
 | --- | --- | --- | ---: |
-| **[mlx5](mlx5/)** | you have a ConnectX/BlueField card | rdma-core, `-tags mlx5` | **67.6 Mpps** |
-| **[afxdp](afxdp/)** | any modern NIC, and you want to keep using it | a driver with XDP support | 18.8 Mpps |
-| **[dpdk](dpdk/)** | Intel/Broadcom/virtio, or you need DPDK's drivers | libdpdk, `-tags dpdk`, usually hugepages | 56.2 Mpps |
+| **[mlx5](mlx5/)** | you have a ConnectX/BlueField card | rdma-core, `-tags mlx5` | **69.2 Mpps** |
+| **[afxdp](afxdp/)** | any modern NIC, and you want to keep using it | a driver with XDP support | 18.7 Mpps |
+| **[dpdk](dpdk/)** | Intel/Broadcom/virtio, or you need DPDK's drivers | libdpdk, `-tags dpdk`, usually hugepages | 56.7 Mpps |
 | **[afpacket](afpacket/)** | it just has to run: a laptop, a VM, a container | nothing at all | 1.7 Mpps |
 
 If you have an NVIDIA/Mellanox ConnectX card, use **mlx5**: it is the fastest
@@ -202,74 +222,89 @@ interface left to carry the rest.
 
 ## Performance
 
-Every backend driven through the same three loops by the same program
+All four backends, driven through the same three loops by the same program
 ([`examples/sweep`](examples/sweep)) on the same pair of machines: AMD EPYC
-9275F, ConnectX-6 Dx at 100G, 64-byte frames on a tagged link. Rates are the
-port's own counters; **cores are measured across the whole machine**, so the
-soft-interrupt work AF_XDP and AF_PACKET do outside your process is counted
-where it falls. One worker per queue, each backend placing its own workers.
+9275F, ConnectX-6 Dx at 100G, 64-byte frames on a tagged link. Measured
+7 September 2026, medians of three passes, default configuration throughout:
+no flags, no tuning.
+
+Two things about the method, because they change what the numbers mean.
+Rates come from the port's own counters, not the application's. And **cores are
+measured across the whole machine**, so the soft-interrupt work AF_XDP and
+AF_PACKET do outside your process is counted where it falls. If you only count
+your own process, the kernel's half of AF_XDP disappears from the benchmark
+even though you are still paying for it.
 
 **One core, one queue**, the number that says how efficient a backend is:
 
 | | transmit | receive | forward |
 | --- | ---: | ---: | ---: |
-| **mlx5** | **67.6 Mpps** | 44.1 Mpps | **29.7 Mpps** |
-| **dpdk** | 56.2 Mpps | **46.1 Mpps** | 23.1 Mpps |
-| **afxdp** | 18.8 Mpps | 32.3 Mpps (1.6 cores) | 17.6 Mpps (2 cores) |
-| **afpacket** | 1.7 Mpps | 0.04 Mpps (41 cores) | 0.03 Mpps (41 cores) |
+| **mlx5** | **69.2 Mpps** | 44.1 Mpps | **29.3 Mpps** |
+| **dpdk** | 56.7 Mpps | **46.1 Mpps** | 22.6 Mpps |
+| **afxdp** | 18.7 Mpps | 31.8 Mpps (1.6 cores) | 17.5 Mpps (2.0 cores) |
+| **afpacket** | 1.7 Mpps | 1.4 Mpps (50 cores) | 0.0 Mpps (50 cores) |
 
-**Scaling to 100G line rate** (148.8 Mpps at 64 bytes; medians of three
-passes). One worker per queue, one queue per core, *default configuration
-throughout*: no flags, no tuning. AF_XDP cells show whole-machine cores
-with the soft-interrupt share in parentheses, because that is where the
-kernel's half of its work lives; the bypass backends run 0.0 softirq.
+**Scaling to 100G line rate** (148.8 Mpps at 64 bytes). One worker per queue,
+one queue per core. AF_XDP and AF_PACKET cells show whole-machine cores with
+the soft-interrupt share in parentheses; the bypass backends run 0.0 softirq.
 
-**Transmit:**
+**Transmit**, a single flow:
 
-| cores | mlx5 | dpdk | afxdp: Mpps on cores (softirq) |
-| ---: | ---: | ---: | ---: |
-| 1 | 67.6 | 56.2 | 18.8 on 1.0 (0.5) |
-| 2 | 97.8 | 106.7 | 35.9 on 2.0 (1.0) |
-| 3 | **147.9** | **148.8** | 53.6 on 3.0 (1.4) |
-| 4 | - | - | 71.1 on 4.0 (2.1) |
-| 6 | - | - | 90.1 on 6.0 (4.1) |
-| 8 | - | - | 120.3 on 8.0 (5.5) |
-| 12 | - | - | 133.6 on 12.0 (7.5) |
-| 16 | - | - | **147.3** on 16.0 (9.6) |
+| cores | mlx5 | dpdk | afxdp | afpacket |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 69.2 | 56.7 | 18.7 (0.5) | 1.7 (0.2) |
+| 2 | 100.7 | 107.9 | 35.7 (1.0) | 2.5 (0.5) |
+| 3 | 147.8 | **148.8** | - | - |
+| 4 | **148.8** | 148.8 | 70.7 (2.0) | 4.6 (1.0) |
+| 8 | - | - | 120.0 (5.3) | 9.0 (1.9) |
+| 12 | - | - | 147.1 (8.2) | - |
+| 16 | - | - | 147.6 (11.2) | 17.4 (4.0) |
+| 20 | - | - | **147.9** (14.0) | - |
 
-**Receive**, offered 148.8:
+**Receive**, offered 148.6:
 
-| cores | mlx5 | dpdk | afxdp: Mpps on cores (softirq) |
-| ---: | ---: | ---: | ---: |
-| 1 | 44.1 | 46.1 | 32.3 on 1.6 (1.0) |
-| 2 | 81.2 | 86.5 | 65.1 on 3.2 (2.0) |
-| 3 | 84.5 | 89.3 | - |
-| 4 | 117.0 | 124.8 | 128.3 on 6.5 (4.0) |
-| 6 | 124.0 | 111.5 | - |
-| 8 | 144.8 | **148.8** | **148.8** on 11.7 (7.7) |
-| 10 | **148.6** | - | - |
-| 16 | - | - | 140.4 on 11.6 (7.2) |
+| cores | mlx5 | dpdk | afxdp | afpacket |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 44.1 | 46.1 | 31.8 on 1.6 (1.0) | 1.4 on 50 (50) |
+| 2 | 81.5 | 85.0 | 67.3 on 3.2 (2.0) | 1.6 on 51 (51) |
+| 4 | 117.8 | 124.9 | 121.9 on 6.5 (4.0) | 1.7 on 51 (51) |
+| 6 | 124.9 | 113.0 | - | - |
+| 8 | 145.6 | **148.6** | 146.5 on 11.4 (7.5) | 2.0 on 53 (53) |
+| 10 | **148.6** | 116.4 | - | - |
+| 12 | 148.6 | - | 145.2 on 12.1 (8.1) | - |
+| 16 | - | - | **146.6** on 11.6 (7.2) | 2.3 on 53 (53) |
 
-**Forwarding**, offered 148.8, next hop nobody owns:
+**Forwarding**, offered 148.6, next hop nobody owns:
 
-| cores | mlx5 | dpdk | afxdp: Mpps on cores (softirq) |
-| ---: | ---: | ---: | ---: |
-| 1 | 29.7 | 23.1 | 17.6 on 2.0 (1.0) |
-| 2 | 58.7 | 44.9 | 32.6 on 4.0 (2.0) |
-| 3 | 61.2 | 62.4 | - |
-| 4 | 87.8 | 74.5 | 52.9 on 8.0 (4.0) |
-| 6 | 100.2 | 61.1 | - |
-| 8 | 140.1 | 126.3 | 77.2 on 16.0 (8.0) |
-| 10 | 144.3 | - | - |
-| 12 | **147.5** | 97.1 | - |
-| 16 | - | - | 112.9 on 23.2 (10.1) |
+| cores | mlx5 | dpdk | afxdp | afpacket |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 29.3 | 22.6 | 17.5 on 2.0 (1.0) | 0.0 on 50 (50) |
+| 2 | 58.0 | 43.6 | 32.5 on 4.0 (2.0) | 0.0 on 50 (50) |
+| 4 | 87.5 | 74.3 | 51.2 on 8.0 (4.0) | 0.0 on 50 (50) |
+| 6 | 100.2 | 60.9 | - | - |
+| 8 | 142.1 | 126.8 | 75.1 on 16.0 (8.0) | 0.0 on 50 (50) |
+| 10 | 146.5 | - | - | - |
+| 12 | **147.4** | 114.7 | 108.0 on 24.0 (12.0) | - |
+| 16 | 141.3 | **143.5** | **138.4** on 28.7 (12.6) | 0.0 on 50 (50) |
 
-**Both bypass backends transmit line rate on three cores; mlx5 receives it
-on ten and forwards it on twelve; DPDK receives it on eight.** AF_XDP
-transmits line rate on sixteen queues, receives it on eight (11.7 machine
-cores: a worker and most of a soft interrupt per queue), and forwards
-about three quarters of it on sixteen workers spending 23 machine cores;
-its run-to-run spread is honest at ±15%, the widest of the three.
+**DPDK transmits line rate on three cores, mlx5 on four** (and 99.3% of it on
+three). **DPDK receives it on eight, mlx5 on ten. mlx5 forwards it on twelve**,
+which is the one place a backend reaches the wire doing real work on every
+packet. AF_XDP gets close everywhere but pays about twice the cores, and half
+of what it spends is soft interrupt: that is the price of leaving the NIC with
+Linux, and depending on what you are building it is a price worth paying.
+
+The write-up of this comparison, including how it lines up against VPP's
+three datapaths on the same card, is
+[Four ways to do super fast packet processing in Go](https://toonk.io/packetio/).
+
+**AF_PACKET does not degrade under load, it collapses.** Its receive row is
+2.3 Mpps for 53 cores, and forwarding under the same flood is essentially
+zero. That is receive livelock: the kernel takes all 148 million frames a
+second whether or not you read them, and your program is starved out. Offer it
+less and it behaves: 12 Mpps received at 12 offered, 7.1 forwarded. Push
+harder and it goes backwards. Every other backend here holds its number under
+a full flood.
 
 A few things worth knowing behind those numbers:
 
@@ -288,8 +323,8 @@ A few things worth knowing behind those numbers:
   near 70 Mpps however many cores it got. The receive ring now prefetches
   each frame as its completion is consumed. One instruction, half the
   gap; the descriptor-mode switch above is the other half.
-- **AF_XDP's kernel half is real work on real cores.** At line-rate
-  receive, 7.7 of the 11.7 cores are soft interrupt: the driver's NAPI
+- **AF_XDP's kernel half is real work on real cores.** At 146.5 Mpps
+  receive, 7.5 of its 11.4 cores are soft interrupt: the driver's NAPI
   poll and the XDP redirect. Counting only your process would call that
   4 cores; the table counts the machine.
 - **The receive flat spot at three workers** (both bypass backends: ~84-89
@@ -429,7 +464,7 @@ a third arrive out of stamp order. Sort if you need order.
 
 | backend | stamps with | resolution | epoch |
 | --- | --- | --- | --- |
-| **mlx5** | the card, at the port | 4 ns | the device's own, meaningless on its own |
+| **mlx5** | the card, at the port | 1 ns | the device's own, meaningless on its own |
 | **afpacket** | the kernel, filling the ring | nanoseconds | CLOCK_REALTIME, so it can step |
 | **afxdp**, **dpdk** | not yet | | |
 

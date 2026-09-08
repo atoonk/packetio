@@ -43,7 +43,7 @@ sudo go run ./examples/timestamps -i eth0 -d 10s
 The gaps come from the time the kernel (or, on a ConnectX, the card) recorded
 as each packet arrived, so a busy moment in this program does not make the
 traffic look bursty. Swap the import and the Open call for `mlx5` and the same
-loop reads the card's own 4 ns clock.
+loop reads the card's own 1 ns clock.
 
 ## Direct Verbs (ConnectX) - `-tags mlx5`
 
@@ -126,7 +126,7 @@ for {
 }
 ```
 
-Measured at 58 Mpps on a ConnectX-6 Dx and 14.9 Mpps - 10G line rate - on an
+Measured at 56.7 Mpps on a ConnectX-6 Dx and 14.9 Mpps - 10G line rate - on an
 Intel X550, with no options and no tuning.
 
 ## Shared code

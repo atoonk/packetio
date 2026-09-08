@@ -137,7 +137,7 @@ nothing: its receive queues take everything and you select in your own loop.
 `Capabilities()` reports no steering, so a program can ask rather than assume.
 
 That tap behaviour is also the performance story. Point a line-rate flood at an
-AF_PACKET receiver and the machine burns **~31 cores of softirq** to deliver
+AF_PACKET receiver and the machine burns **~50 cores of softirq** to deliver
 1.7 Mpps of useful packets - the rest is the kernel dutifully processing (and
 dropping) the originals of everything you are reading copies of.
 
@@ -166,21 +166,33 @@ offsets shifted to match.
 
 ## Performance
 
-68-byte frames on a ConnectX-6 Dx, one core:
+64-byte frames on a ConnectX-6 Dx, one core:
 
 | | rate | cores |
 | --- | ---: | ---: |
 | transmit, one queue | 1.7 Mpps | 1 |
-| transmit, sixteen queues | 17.0 Mpps | 16 |
-| receive, under a line-rate flood | 1.6 Mpps | **41** |
-| forwarding | 1.3 Mpps | **41** |
+| transmit, sixteen queues | 17.4 Mpps | 16 |
+| receive, under a line-rate flood | 1.4 Mpps | **50** |
+| receive, offered 12 Mpps | **12.0 Mpps** | 16 sockets |
+| forwarding, under a line-rate flood | 0.01 Mpps | **50** |
+| forwarding, offered 12 Mpps | **7.1 Mpps** | 16 sockets |
 
 Those core counts are not a typo and they are the whole story: under a
 148.8 Mpps flood the kernel processes every frame whether or not your program
-reads a copy, so the machine burns 41 cores to hand you 1.6 Mpps.
+reads a copy, so the machine burns 50 cores to hand you 1.4 Mpps.
 
-More transmit queues do **not** help: the device queue saturates and every
-socket contends on it.
+Note the two pairs of rows. **AF_PACKET does not slow down under overload, it
+collapses.** Offered 12 Mpps it takes all of it; offered 25 it takes 3;
+offered a full 148.8 it takes 1.4 and forwards essentially nothing. That is
+receive livelock, and it is the one failure mode here that gets worse the
+harder you push. Every other backend in this repository holds its number under
+a full flood. If you are using a packet socket, keep the offered load well
+under its knee.
+
+Transmit does scale with sockets, at about 1.1 Mpps each: 1.7 / 2.5 / 4.6 /
+9.0 / 17.4 on 1 / 2 / 4 / 8 / 16. Receive barely moves, because there the
+ceiling is the kernel's own processing of every frame on the wire and not how
+many rings you drain it into.
 
 ## What it is good for
 

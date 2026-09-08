@@ -16,13 +16,24 @@ Everything the filter does not match carries on into the kernel. `ip`,
 
 - A driver with **XDP support** (Intel, Mellanox, Broadcom and others; zero-copy
   varies).
-- `CAP_NET_RAW`, and a memory lock limit for the UMEM (`ulimit -l unlimited`, or
+- Root, or `CAP_NET_RAW` + `CAP_NET_ADMIN` + `CAP_BPF`: attaching the XDP
+  program needs more than opening the socket does. Plus a memory lock limit
+  for the UMEM (`ulimit -l unlimited`, or
   root).
 - No build tag, no hugepages, no unbinding.
 
 ## Open it
 
 AF_XDP is the one backend that makes you say what you want:
+
+go-afxdp's package is also called `afxdp`, so the snippets below alias it:
+
+```go
+import (
+        "github.com/atoonk/packetio/afxdp"
+        xdp "github.com/atoonk/go-afxdp"   // the options passed through WithXDP
+)
+```
 
 ```go
 d, err := afxdp.Open("eth0", afxdp.WithSteering(packetio.SteeringFilter{
@@ -147,31 +158,31 @@ Medians of three passes, defaults only.
 
 | | rate | cores (softirq) |
 | --- | ---: | ---: |
-| transmit, one queue | 18.8 Mpps | 1.0 (0.5) |
-| transmit, line rate | **147.3 Mpps** | 16 queues, 16.0 (9.6) |
-| receive, one queue | 32.3 Mpps | 1.6 (1.0) |
-| receive, line rate | **148.8 Mpps** | **8 queues, 11.7 (7.7)** |
-| forwarding, one queue | 17.6 Mpps | 2.0 (1.0) |
-| forwarding, best | 112.9 Mpps | 16 queues, 23.2 (10.1) |
+| transmit, one queue | 18.7 Mpps | 1.0 (0.5) |
+| transmit, best | **147.9 Mpps** | 20 queues, 20.0 (14.0) |
+| receive, one queue | 31.8 Mpps | 1.6 (1.0) |
+| receive, best | **146.6 Mpps** | **16 queues, 11.6 (7.2)** |
+| forwarding, one queue | 17.5 Mpps | 2.0 (1.0) |
+| forwarding, best | 138.4 Mpps | 16 queues, 28.7 (12.6) |
 
 Transmit has two slopes, and the backend picks between them for you (via
 go-afxdp v0.11.0): up to four queues it runs the driver's pointer
-descriptors at ~17.9 Mpps per core (18.8 / 35.9 / 53.6 / 71.1 on 1-4),
+descriptors at ~17.7 Mpps per core (18.7 / 35.7 / 70.7 on 1 / 2 / 4),
 then switches back to the kernel's copied multi-packet path, whose per-core
-cost is higher but whose ceiling scales to the wire: 90.1 / 120.3 / 147.3
-at 6 / 8 / 16. Receive and forward cost about **1.5-2 cores per queue**,
+cost is higher but whose ceiling scales to the wire: 120.0 / 147.1 / 147.6
+at 8 / 12 / 16. Receive and forward cost about **1.5-2 cores per queue**,
 a worker and its soft interrupt - which is why sixteen forwarding queues
-spend 23 machine cores, ten of them in softirq.
+spend 29 machine cores, thirteen of them in softirq.
 
 Placement matters more here than anywhere else: with go-afxdp choosing, one
-transmit queue does 18.8 Mpps on a single core; pinned by hand to a core of
+transmit queue does 18.7 Mpps on a single core; pinned by hand to a core of
 our choosing it did 6.5 on two. Let it place its own workers.
 
-Receive reaches **line rate - 148.8 Mpps - on 8 queues** (11.7 machine
-cores), 32.3 / 65.1 / 128.3 Mpps at 1 / 2 / 4. Expect ±15% run-to-run
+Receive gets to **146.5 Mpps on 8 queues** (11.4 machine cores) and no
+further: 31.8 / 67.3 / 121.9 Mpps at 1 / 2 / 4. Expect ±15% run-to-run
 spread on this backend - it is the widest of the four. An earlier version
 degraded *down* to 5.9 Mpps at sixteen queues; the root cause and the
-three-line fix are below.
+three-line fix are in the gotcha above.
 
 ## Examples
 
