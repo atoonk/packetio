@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.7
 
 **netstack: gVisor's TCP/IP stack over every backend.** A new module,
 `github.com/atoonk/packetio/netstack`, runs gVisor's netstack on a
