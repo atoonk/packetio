@@ -1,0 +1,32 @@
+From de13729c880c268dc189188ddb02db4f0d324fa9 Mon Sep 17 00:00:00 2001
+From: Andree Toonk <andree@toonk.io>
+Date: Mon, 7 Sep 2026 16:52:12 +0000
+Subject: [PATCH 13/13] tcpip: zero the header room a packet buffer reserves
+
+A protocol that pushes a header and leaves a field unwritten -- ICMPv4 byte
+5, ARP without a target link address -- sends whatever the recycled chunk
+held. Only the reserved header is cleared, not the data.
+---
+ pkg/tcpip/stack/packet_buffer.go | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/pkg/tcpip/stack/packet_buffer.go b/pkg/tcpip/stack/packet_buffer.go
+index 2877f3d..b0156e3 100644
+--- a/pkg/tcpip/stack/packet_buffer.go
++++ b/pkg/tcpip/stack/packet_buffer.go
+@@ -185,6 +185,12 @@ func NewPacketBuffer(opts PacketBufferOptions) *PacketBuffer {
+ 	pk.reset()
+ 	if opts.ReserveHeaderBytes != 0 {
+ 		v := buffer.NewViewSize(opts.ReserveHeaderBytes)
++		// Header room a protocol pushes into and does not entirely write --
++		// ICMPv4's unused byte, ARP's target link address -- would otherwise
++		// carry whatever the pooled chunk last held onto the wire, since
++		// chunks are not zeroed on reuse. This is the header, tens of bytes,
++		// not the packet's data.
++		clear(v.AsSlice())
+ 		pk.buf.Append(v)
+ 		pk.reserved = opts.ReserveHeaderBytes
+ 	}
+-- 
+2.43.0
+

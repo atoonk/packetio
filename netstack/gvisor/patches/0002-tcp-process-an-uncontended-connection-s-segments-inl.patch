@@ -1,0 +1,254 @@
+From 00c508bcecfb5a725cc6e36628eb92690c7f926a Mon Sep 17 00:00:00 2001
+From: Andree Toonk <andree@toonk.io>
+Date: Sun, 6 Sep 2026 19:16:07 +0000
+Subject: [PATCH 02/13] tcp: process an uncontended connection's segments
+ inline
+
+tcp.InlineProcessing handles a segment for an established, uncontended
+endpoint on the goroutine that delivered it (a TryLock and
+handleSegmentsLocked) instead of queueing it for a processor goroutine,
+only when the flags carry no SYN, RST or FIN and the state stays
+ESTABLISHED. tcp.BatchProcessing runs the work the inline path cannot
+take (a listener's SYN and the handshake, FIN, close) on the delivering
+goroutine after the batch, through tcp.DrainDeferred. tcp.TxHashFromRx
+copies the receive queue into the connection's transmit hash so replies
+leave on the queue the receive goroutine owns. The handoff to a processor
+goroutine was one wakeup per request: 458k to 661k req/s at the time.
+---
+ pkg/tcpip/transport/tcp/dispatcher.go | 177 +++++++++++++++++++++-----
+ pkg/tcpip/transport/tcp/endpoint.go   |   2 +-
+ 2 files changed, 148 insertions(+), 31 deletions(-)
+
+diff --git a/pkg/tcpip/transport/tcp/dispatcher.go b/pkg/tcpip/transport/tcp/dispatcher.go
+index d138e3b..ea73b75 100644
+--- a/pkg/tcpip/transport/tcp/dispatcher.go
++++ b/pkg/tcpip/transport/tcp/dispatcher.go
+@@ -215,7 +215,15 @@ func handleConnected(ep *Endpoint) {
+ 	// we get to handleSegments the endpoint may not be in ESTABLISHED. But
+ 	// this should be fine as all normal shutdown states are handled by
+ 	// handleSegmentsLocked.
+-	switch err := ep.handleSegmentsLocked(); {
++	// An error the inline fast path could not act on is handled first, as if
++	// this call had produced it.
++	err := ep.inlineErr
++	ep.inlineErr = nil
++	ep.inlineDeferred.Store(false)
++	if err == nil {
++		err = ep.handleSegmentsLocked()
++	}
++	switch {
+ 	case err != nil:
+ 		// Send any active resets if required.
+ 		ep.resetConnectionLocked(err)
+@@ -336,34 +344,7 @@ func (p *processor) start(wg *sync.WaitGroup) {
+ 				if ep == nil {
+ 					break
+ 				}
+-				if ep.segmentQueue.empty() {
+-					continue
+-				}
+-				switch state := ep.EndpointState(); {
+-				case state.connecting():
+-					handleConnecting(ep)
+-				case state.connected() && state != StateTimeWait:
+-					handleConnected(ep)
+-				case state == StateTimeWait:
+-					handleTimeWait(ep)
+-				case state == StateListen:
+-					handleListen(ep)
+-				case state == StateError || state == StateClose:
+-					// Try to redeliver any still queued
+-					// packets to another endpoint or send a
+-					// RST if it can't be delivered.
+-					ep.mu.Lock()
+-					if st := ep.EndpointState(); st == StateError || st == StateClose {
+-						ep.drainClosingSegmentQueue()
+-					}
+-					ep.mu.Unlock()
+-				default:
+-					panic(fmt.Sprintf("unexpected tcp state in processor: %v", state))
+-				}
+-				// If there are more segments to process and the
+-				// endpoint lock is not held by user then
+-				// requeue this endpoint for processing.
+-				if !ep.segmentQueue.empty() && !ep.isOwnedByUser() {
++				if processEndpoint(ep) {
+ 					p.epQ.enqueue(ep)
+ 				}
+ 			}
+@@ -371,6 +352,82 @@ func (p *processor) start(wg *sync.WaitGroup) {
+ 	}
+ }
+ 
++// processEndpoint does one round of protocol work for an endpoint that has
++// segments queued (or an inline error to act on), and reports whether it
++// should be queued again because segments remain and no user holds it.
++func processEndpoint(ep *Endpoint) bool {
++	if ep.segmentQueue.empty() && !ep.inlineDeferred.Load() {
++		return false
++	}
++	switch state := ep.EndpointState(); {
++	case state.connecting():
++		handleConnecting(ep)
++	case state.connected() && state != StateTimeWait:
++		handleConnected(ep)
++	case state == StateTimeWait:
++		handleTimeWait(ep)
++	case state == StateListen:
++		handleListen(ep)
++	case state == StateError || state == StateClose:
++		// Try to redeliver any still queued packets to another endpoint
++		// or send a RST if it can't be delivered.
++		ep.mu.Lock()
++		if st := ep.EndpointState(); st == StateError || st == StateClose {
++			ep.drainClosingSegmentQueue()
++		}
++		ep.mu.Unlock()
++	default:
++		panic(fmt.Sprintf("unexpected tcp state in processor: %v", state))
++	}
++	// If there is more to do -- segments, or an inline error this round
++	// could not take because a user held the endpoint -- and the endpoint
++	// lock is not held by a user, requeue it for processing.
++	return (!ep.segmentQueue.empty() || ep.inlineDeferred.Load()) && !ep.isOwnedByUser()
++}
++
++// BatchProcessing, when true, keeps the work the inline fast path cannot do
++// — a listener's SYN and the handshake it starts, a connection's FIN and
++// close, anything that changes state or needs the demuxer's write lock — on
++// the goroutine that delivered the segments, run after the delivery batch
++// through DrainDeferred instead of waking a processor goroutine for it. The
++// delivering goroutine holds the demuxer's read lock during the batch and
++// nothing afterwards, so the deferred work can take any lock. A link
++// endpoint that delivers in batches calls DrainDeferred after each; the
++// processor goroutines remain for work other goroutines (timers) queue.
++var BatchProcessing bool
++
++// queueEndpoint hands an endpoint with queued segments to whoever processes
++// it next: the delivering goroutine's after-batch pass, or a processor.
++func (d *dispatcher) queueEndpoint(id stack.TransportEndpointID, ep *Endpoint) {
++	if BatchProcessing {
++		d.deferred.enqueue(ep)
++		return
++	}
++	d.selectProcessor(id).queueEndpoint(ep)
++}
++
++// drainDeferred runs the deferred work; see BatchProcessing.
++func (d *dispatcher) drainDeferred() {
++	for {
++		ep := d.deferred.dequeue()
++		if ep == nil {
++			return
++		}
++		if processEndpoint(ep) {
++			d.deferred.enqueue(ep)
++		}
++	}
++}
++
++// DrainDeferred runs, on the calling goroutine, the protocol work that
++// BatchProcessing set aside for after the delivery batch. The caller must
++// hold no stack lock.
++func DrainDeferred(s *stack.Stack) {
++	if p, ok := s.TransportProtocolInstance(ProtocolNumber).(*protocol); ok {
++		p.dispatcher.drainDeferred()
++	}
++}
++
+ // pause pauses the processor loop.
+ func (p *processor) pause() chan struct{} {
+ 	p.pauseWaker.Assert()
+@@ -393,6 +450,7 @@ func (p *processor) resume() {
+ // +stateify savable
+ type dispatcher struct {
+ 	processors []processor
++	deferred   epQueue        // work set aside for DrainDeferred (see BatchProcessing)
+ 	wg         sync.WaitGroup `state:"nosave"`
+ 	hasher     jenkinsHasher
+ 	mu         dispatcherMutex `state:"nosave"`
+@@ -505,8 +563,67 @@ func (d *dispatcher) queuePacket(stackEP stack.TransportEndpoint, id stack.Trans
+ 	// goroutine as endpoint.UnlockUser will wake up the processor if the
+ 	// segment queue is not empty.
+ 	if !ep.isOwnedByUser() {
+-		d.selectProcessor(id).queueEndpoint(ep)
++		if InlineProcessing && s.flags&(header.TCPFlagSyn|header.TCPFlagRst|header.TCPFlagFin) == 0 &&
++			ep.EndpointState() == StateEstablished && handleEstablishedInline(ep, pkt.Hash) {
++			if !ep.segmentQueue.empty() && !ep.isOwnedByUser() {
++				d.queueEndpoint(id, ep)
++			}
++			return
++		}
++		d.queueEndpoint(id, ep)
++	}
++}
++
++// InlineProcessing, when true, lets an established connection's inbound
++// segments be processed on the goroutine that delivered them when the
++// endpoint is uncontended, instead of always handing them to a processor
++// goroutine. That saves one goroutine wakeup per inbound batch, which on a
++// low-latency link is a large share of a request's round trip. Per-connection
++// ordering is unchanged: a connection's segments arrive on one goroutine, and
++// the endpoint lock serializes it against the processor and timers.
++//
++// Only segments that cannot close the connection are handled this way (no
++// SYN, RST or FIN, and only in ESTABLISHED), because the delivering caller
++// holds the transport demuxer's read lock and closing an endpoint needs it
++// for writing. Anything unexpected is left to the processor.
++var InlineProcessing bool
++
++// TxHashFromRx, when true, sets a connection's transmit hash (which picks
++// the link endpoint's transmit queue) from the receive hash of each inbound
++// segment it processes inline, so replies leave on the queue the request
++// arrived on. The link endpoint must set pkt.Hash to its receive queue for
++// this to mean anything.
++var TxHashFromRx bool
++
++// handleEstablishedInline is handleConnected for the inline fast path. It
++// reports false, having done nothing the processor would not redo, when the
++// endpoint is contended or when processing produced an error or a state
++// change — those need the processor, which runs without the demuxer lock.
++func handleEstablishedInline(ep *Endpoint, rxHash uint32) bool {
++	if !ep.TryLock() {
++		return false
++	}
++	if ep.EndpointState() != StateEstablished {
++		ep.mu.Unlock()
++		return false
+ 	}
++	if TxHashFromRx {
++		// Transmit on whatever queue the peer's segments arrive on: the link
++		// endpoint that set pkt.Hash to its receive queue then sends the
++		// reply on the socket owned by the goroutine handling it.
++		ep.txHash = rxHash
++	}
++	err := ep.handleSegmentsLocked()
++	if err != nil || ep.EndpointState() != StateEstablished {
++		// Cannot be finished here (see InlineProcessing); hand the error,
++		// if any, to the processor along with the endpoint.
++		ep.inlineErr = err
++		ep.inlineDeferred.Store(true)
++		ep.mu.Unlock()
++		return false
++	}
++	ep.mu.Unlock()
++	return true
+ }
+ 
+ // selectProcessor uses a hash of the transport endpoint ID to queue the
+diff --git a/pkg/tcpip/transport/tcp/endpoint.go b/pkg/tcpip/transport/tcp/endpoint.go
+index 2a1ace9..d15ed83 100644
+--- a/pkg/tcpip/transport/tcp/endpoint.go
++++ b/pkg/tcpip/transport/tcp/endpoint.go
+@@ -725,7 +725,7 @@ func (e *Endpoint) UnlockUser() {
+ 	// segments can be queued between the time we check if queue is empty
+ 	// and actually unlock the endpoint mutex.
+ 	e.segmentQueue.mu.Lock()
+-	if e.segmentQueue.emptyLocked() {
++	if e.segmentQueue.emptyLocked() && !e.inlineDeferred.Load() {
+ 		if e.ownedByUser.Swap(0) != 1 {
+ 			panic("e.UnlockUser() called without calling e.LockUser()")
+ 		}
+-- 
+2.43.0
+

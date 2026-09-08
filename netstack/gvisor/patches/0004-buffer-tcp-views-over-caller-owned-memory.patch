@@ -1,0 +1,79 @@
+From 0de6b00486550b87d576c2470efce54b303f6c48 Mon Sep 17 00:00:00 2001
+From: Andree Toonk <andree@toonk.io>
+Date: Sun, 6 Sep 2026 19:16:07 +0000
+Subject: [PATCH 04/13] buffer, tcp: views over caller-owned memory
+
+buffer.NewViewFromExternal and NewViewFromExternalSized wrap memory the
+caller owns, never written by the stack, released by callback when the
+last reference goes; View.External reads it back. tcp.Endpoint.WriteExternal
+queues such views as one segment without the copy Write makes. Transmit
+without copying payload: a frame that already sits in the NIC's memory goes
+from the application through TCP to the wire untouched.
+---
+ pkg/buffer/view.go | 43 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/buffer/view.go b/pkg/buffer/view.go
+index 6c8d17e..bcac56e 100644
+--- a/pkg/buffer/view.go
++++ b/pkg/buffer/view.go
+@@ -83,6 +83,45 @@ func NewViewWithData(data []byte) *View {
+ 	return v
+ }
+ 
++// NewViewFromExternal returns a View over memory the caller owns, without
++// copying it. The View (and every clone of it) only ever reads the memory;
++// release is called exactly once, when the last reference to it is gone, and
++// the memory must stay valid until then. That is how a transmit path hands a
++// TCP endpoint payload that already lives where the NIC can reach it.
++func NewViewFromExternal(data []byte, release func()) *View {
++	c := newExternalChunk(data, release)
++	v := viewPool.Get().(*View)
++	*v = View{chunk: c, write: len(data)}
++	return v
++}
++
++// NewViewFromExternalSized is NewViewFromExternal for memory whose byte
++// count as seen by the stack (size) is not the length of the slice: the
++// caller lays the view's bytes out in span with gaps it alone understands
++// (a content cache with header room before each segment's worth of
++// payload). The stack only ever counts, splits and clones such a view; the
++// one reader of its bytes is the link endpoint that built it, which gets
++// span and the view's window from External.
++func NewViewFromExternalSized(span []byte, size int, release func()) *View {
++	if size < 0 || size > len(span) {
++		panic("NewViewFromExternalSized: size out of range")
++	}
++	c := newExternalChunk(span, release)
++	v := viewPool.Get().(*View)
++	*v = View{chunk: c, write: size}
++	return v
++}
++
++// External returns, for a view over caller-owned memory, the memory it was
++// made with and the view's window [read, write) into its byte count; ok is
++// false for an ordinary view.
++func (v *View) External() (span []byte, read, write int, ok bool) {
++	if v == nil || v.chunk == nil || !v.chunk.external {
++		return nil, 0, 0, false
++	}
++	return v.chunk.data, v.read, v.write, true
++}
++
+ // Clone creates a shallow clone of v where the underlying chunk is shared.
+ //
+ // The caller must own the View to call Clone. It is not safe to call Clone
+@@ -119,7 +158,9 @@ func (v *View) Reset() {
+ }
+ 
+ func (v *View) sharesChunk() bool {
+-	return v.chunk.refCount.Load() > 1
++	// External memory is never written through a View, so it always reads
++	// as shared: any writer copies it into a chunk of its own first.
++	return v.chunk.external || v.chunk.refCount.Load() > 1
+ }
+ 
+ // Full indicates the chunk is full.
+-- 
+2.43.0
+

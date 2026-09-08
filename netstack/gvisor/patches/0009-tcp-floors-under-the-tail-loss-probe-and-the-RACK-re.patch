@@ -1,0 +1,157 @@
+From de95a0809ac06f2ca3c5161dbc52077b3b63fb29 Mon Sep 17 00:00:00 2001
+From: Andree Toonk <andree@toonk.io>
+Date: Sun, 6 Sep 2026 19:16:07 +0000
+Subject: [PATCH 09/13] tcp: floors under the tail loss probe and the RACK
+ reorder window
+
+tcp.MinPTO (10 ms) bounds the tail loss probe timeout from below:
+upstream's is twice the smoothed RTT with no floor, which on a LAN is less
+than a peer's delayed ACK, so it probed and retransmitted almost every
+tail. tcp.TLPSkipWindowLimited arms no probe while only the peer's window
+holds the sender back. tcp.MinReorderWindow and
+tcp.ReorderWindowDupthreshOverride keep RACK from mistaking a LAN's
+ordinary reordering for loss. tcp.TLPProbes and tcp.RACKLossMarks count.
+---
+ pkg/tcpip/transport/tcp/rack.go | 68 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 67 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/tcpip/transport/tcp/rack.go b/pkg/tcpip/transport/tcp/rack.go
+index 1840760..a606dbe 100644
+--- a/pkg/tcpip/transport/tcp/rack.go
++++ b/pkg/tcpip/transport/tcp/rack.go
+@@ -15,6 +15,7 @@
+ package tcp
+ 
+ import (
++	"sync/atomic"
+ 	"time"
+ 
+ 	"gvisor.dev/gvisor/pkg/tcpip"
+@@ -37,6 +38,26 @@ const (
+ 	tcpRACKRecoveryThreshold = 16
+ )
+ 
++// MinReorderWindow is a floor on the RACK reorder window.
++//
++// RACK derives its reorder window from min_RTT/4, capped at the smoothed RTT.
++// On a low-latency link that is a few microseconds, which is far less than the
++// reordering a NIC or switch introduces at 10G, so ordinary reordering is
++// misread as loss and triggers a spurious fast retransmit. Linux avoids this by
++// also growing a dynamic reordering threshold (up to 300 packets) rather than
++// declaring loss at a fixed three SACKed segments; gVisor has no such
++// adaptation, so on a fast LAN it collapses its congestion window repeatedly.
++//
++// This floor keeps the window wide enough to absorb that reordering. Set it to
++// zero to restore upstream behaviour.
++var MinReorderWindow = 0 * time.Microsecond
++
++// ReorderWindowDupthreshOverride, when true, stops the reorder window from
++// being zeroed once RACK.pkts_sacked reaches the classic DUPACK threshold.
++// That early return is the other half of the same problem: three SACKed
++// segments collapse the window to zero however mild the reordering was.
++var ReorderWindowDupthreshOverride = false
++
+ // RACK is a loss detection algorithm used in TCP to detect packet loss and
+ // reordering using transmission timestamp of the packets instead of packet or
+ // sequence counts. To use RACK, SACK should be enabled on the connection.
+@@ -159,8 +180,20 @@ func (rc *rackControl) setDSACKSeen(dsackSeen bool) {
+ // shouldSchedulePTO dictates whether we should schedule a PTO or not.
+ // See https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.5.1.
+ //
++// +checklocks:s.ep.mu
++// windowLimited reports whether the sender has more to send and only the
++// peer's advertised window is holding it back.
++//
++// +checklocks:s.ep.mu
++func (s *sender) windowLimited() bool {
++	return s.writeNext != nil && !s.SndNxt.LessThan(s.SndUna.Add(s.SndWnd))
++}
++
+ // +checklocks:s.ep.mu
+ func (s *sender) shouldSchedulePTO() bool {
++	if TLPSkipWindowLimited && s.windowLimited() {
++		return false
++	}
+ 	// Schedule PTO only if RACK loss detection is enabled.
+ 	return s.ep.tcpRecovery&tcpip.TCPRACKLossDetection != 0 &&
+ 		// The connection supports SACK.
+@@ -184,6 +217,9 @@ func (s *sender) schedulePTO() {
+ 		if s.Outstanding == 1 {
+ 			pto += wcDelayedACKTimeout
+ 		}
++		if pto < MinPTO {
++			pto = MinPTO
++		}
+ 	}
+ 	s.rtt.Unlock()
+ 
+@@ -198,6 +234,31 @@ func (s *sender) schedulePTO() {
+ 	s.probeTimer.enable(pto)
+ }
+ 
++// TLPProbes counts tail loss probe timer expiries and RACKLossMarks the
++// segments RACK marked lost by time, so that a stack's retransmits can be
++// told apart by cause (a link that holds segments back delays their
++// acknowledgements, and both can fire on delay alone).
++var (
++	TLPProbes     atomic.Uint64
++	RACKLossMarks atomic.Uint64
++)
++
++// MinPTO is the floor of the tail loss probe timeout. Upstream has none:
++// the timeout is twice the smoothed RTT, which on a LAN measured precisely
++// is a few hundred microseconds, less than a peer's delayed ACK or a link
++// that batches, so the probe fires, retransmits the tail and is DSACKed
++// almost every time. Linux adds a fixed minimum (its TCP_TIMEOUT_MIN) and
++// rounds up to a jiffy; RFC 8985 leaves the floor to the implementation.
++var MinPTO = 10 * time.Millisecond
++
++// TLPSkipWindowLimited stops the tail loss probe from being armed while the
++// sender has data ready that only the peer's advertised window holds back.
++// Such a connection has no tail to probe: the peer has the bytes and has not
++// read them, so the probe can only retransmit data that is not lost, and it
++// fires on every object a slow reader fetches. RFC 8985 arms the probe to
++// cover the tail of a flight, not a receiver that is behind.
++var TLPSkipWindowLimited = true
++
+ // probeTimerExpired is the same as TLP_send_probe() as defined in
+ // https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.5.2.
+ //
+@@ -207,6 +268,7 @@ func (s *sender) probeTimerExpired() tcpip.Error {
+ 	if s.probeTimer.isUninitialized() || !s.probeTimer.checkExpiration() {
+ 		return nil
+ 	}
++	TLPProbes.Add(1)
+ 
+ 	var dataSent bool
+ 	if s.writeNext != nil && s.writeNext.xmitCount == 0 && s.Outstanding < s.SndCwnd {
+@@ -348,7 +410,7 @@ func (rc *rackControl) updateRACKReorderWindow() {
+ 			return
+ 		}
+ 
+-		if snd.SackedOut >= nDupAckThreshold {
++		if snd.SackedOut >= nDupAckThreshold && !ReorderWindowDupthreshOverride {
+ 			rc.ReoWnd = 0
+ 			return
+ 		}
+@@ -364,6 +426,9 @@ func (rc *rackControl) updateRACKReorderWindow() {
+ 	if srtt < rc.ReoWnd {
+ 		rc.ReoWnd = srtt
+ 	}
++	if rc.ReoWnd < MinReorderWindow {
++		rc.ReoWnd = MinReorderWindow
++	}
+ }
+ 
+ func (rc *rackControl) exitRecovery() {
+@@ -393,6 +458,7 @@ func (rc *rackControl) detectLoss(rcvTime tcpip.MonotonicTime) int {
+ 			timeRemaining := seg.xmitTime.Sub(rcvTime) + rc.RTT + rc.ReoWnd
+ 			if timeRemaining <= 0 {
+ 				seg.lost = true
++				RACKLossMarks.Add(1)
+ 				numLost++
+ 			} else if timeRemaining > timeout {
+ 				timeout = timeRemaining
+-- 
+2.43.0
+

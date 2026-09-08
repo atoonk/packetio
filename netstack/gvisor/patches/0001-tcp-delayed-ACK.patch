@@ -1,0 +1,54 @@
+From f43b43be47504e6ede7f7ecf96c3e43b30868f01 Mon Sep 17 00:00:00 2001
+From: Andree Toonk <andree@toonk.io>
+Date: Sun, 6 Sep 2026 19:16:07 +0000
+Subject: [PATCH 01/13] tcp: delayed ACK
+
+tcp.DelayedACKTimeout holds a pure ACK briefly when under 2 MSS is
+unacknowledged (RFC 5681 4.2), so a reply can carry it. Upstream has no
+delayed ACK at all: every inbound batch is answered with a bare ACK, a
+second frame per request for request/response servers. Zero keeps the
+upstream behaviour.
+---
+ pkg/tcpip/transport/tcp/connect.go        | 12 ++++++++++--
+ pkg/tcpip/transport/tcp/endpoint_state.go |  1 +
+ 2 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/pkg/tcpip/transport/tcp/connect.go b/pkg/tcpip/transport/tcp/connect.go
+index d6ad34e..fadefaf 100644
+--- a/pkg/tcpip/transport/tcp/connect.go
++++ b/pkg/tcpip/transport/tcp/connect.go
+@@ -1300,9 +1300,17 @@ func (e *Endpoint) handleSegmentsLocked() tcpip.Error {
+ 		e.route.ConfirmReachable()
+ 	}
+ 
+-	// Send an ACK for all processed packets if needed.
++	// Send an ACK for all processed packets if needed. With DelayedACKTimeout
++	// set, and less than two MSS unacknowledged, hold it briefly instead so a
++	// reply can carry it; bulk receive keeps its ACK clock either way.
+ 	if e.rcv.RcvNxt != e.snd.MaxSentAck {
+-		e.snd.sendAck()
++		if DelayedACKTimeout > 0 && e.snd.MaxSentAck.Size(e.rcv.RcvNxt) < seqnum.Size(2*uint32(e.amss)) {
++			if !e.snd.delayedAckTimer.enabled() {
++				e.snd.delayedAckTimer.enable(DelayedACKTimeout)
++			}
++		} else {
++			e.snd.sendAck()
++		}
+ 	}
+ 
+ 	e.resetKeepaliveTimer(true /* receivedData */)
+diff --git a/pkg/tcpip/transport/tcp/endpoint_state.go b/pkg/tcpip/transport/tcp/endpoint_state.go
+index d2a8c6d..3e70fa3 100644
+--- a/pkg/tcpip/transport/tcp/endpoint_state.go
++++ b/pkg/tcpip/transport/tcp/endpoint_state.go
+@@ -188,6 +188,7 @@ func (e *Endpoint) Restore(s *stack.Stack) {
+ 		snd.reorderTimer.init(s.Clock(), timerHandler(e, e.snd.rc.reorderTimerExpired))
+ 		snd.probeTimer.init(s.Clock(), timerHandler(e, e.snd.probeTimerExpired))
+ 		snd.corkTimer.init(s.Clock(), timerHandler(e, e.snd.corkTimerExpired))
++		snd.delayedAckTimer.init(s.Clock(), timerHandler(e, e.snd.delayedAckTimerExpired))
+ 	}
+ 	e.ops.InitHandler(e, e.stack, GetTCPSendBufferLimits, GetTCPReceiveBufferLimits)
+ 	e.segmentQueue.thaw()
+-- 
+2.43.0
+

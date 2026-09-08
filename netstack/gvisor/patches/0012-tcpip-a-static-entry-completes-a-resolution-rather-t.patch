@@ -1,0 +1,33 @@
+From a73fa108601a7297d8cba377491d96f2b4a56396 Mon Sep 17 00:00:00 2001
+From: Andree Toonk <andree@toonk.io>
+Date: Mon, 7 Sep 2026 01:55:25 +0000
+Subject: [PATCH 12/13] tcpip: a static entry completes a resolution rather
+ than aborting it
+
+A link address learned from a frame while ARP for that peer is outstanding
+dropped every packet queued behind the resolution.
+---
+ pkg/tcpip/stack/neighbor_cache.go | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/pkg/tcpip/stack/neighbor_cache.go b/pkg/tcpip/stack/neighbor_cache.go
+index 94c53e3..cfb5d3f 100644
+--- a/pkg/tcpip/stack/neighbor_cache.go
++++ b/pkg/tcpip/stack/neighbor_cache.go
+@@ -194,6 +194,13 @@ func (n *neighborCache) addStaticEntry(addr tcpip.Address, linkAddr tcpip.LinkAd
+ 		entry.mu.Lock()
+ 		if entry.mu.neigh.State != Static {
+ 			// Dynamic entry found with the same address.
++			if entry.mu.neigh.State == Incomplete && len(linkAddr) != 0 {
++				// A resolution is outstanding, with packets waiting behind
++				// it. The link address is now known, so complete it and let
++				// them go, rather than removing the entry, which would abort
++				// the resolution and drop them.
++				entry.handleConfirmationLocked(linkAddr, ReachabilityConfirmationFlags{Solicited: true, Override: true})
++			}
+ 			n.mu.dynamic.lru.Remove(entry)
+ 			n.mu.dynamic.count--
+ 		} else if entry.mu.neigh.LinkAddr == linkAddr {
+-- 
+2.43.0
+

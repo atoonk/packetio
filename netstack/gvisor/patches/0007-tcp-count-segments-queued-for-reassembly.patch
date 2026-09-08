@@ -1,0 +1,79 @@
+From 8efa6308f801e044fdb00f694a1488f52efa489f Mon Sep 17 00:00:00 2001
+From: Andree Toonk <andree@toonk.io>
+Date: Sun, 6 Sep 2026 19:16:07 +0000
+Subject: [PATCH 07/13] tcp: count segments queued for reassembly
+
+tcp.OutOfOrderSegments, stack-wide: whether a peer's reorder reports
+reflect delivery order here. Also lets a segment at or beyond RCV.NXT have
+its ACK processed while the advertised window is zero (its data is not
+consumed): RFC 793's literal rule let a bidirectional bulk connection wedge
+when our window closed and the peer's retransmit at RCV.NXT was dropped
+with its ACK. Linux accepts that segment.
+---
+ pkg/tcpip/transport/tcp/rcv.go | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/pkg/tcpip/transport/tcp/rcv.go b/pkg/tcpip/transport/tcp/rcv.go
+index 7370fe9..f28d94d 100644
+--- a/pkg/tcpip/transport/tcp/rcv.go
++++ b/pkg/tcpip/transport/tcp/rcv.go
+@@ -17,6 +17,7 @@ package tcp
+ import (
+ 	"container/heap"
+ 	"math"
++	"sync/atomic"
+ 
+ 	"gvisor.dev/gvisor/pkg/tcpip"
+ 	"gvisor.dev/gvisor/pkg/tcpip/header"
+@@ -452,6 +453,11 @@ func (r *receiver) handleRcvdSegmentClosing(s *segment, state EndpointState, clo
+ // handleRcvdSegment handles TCP segments directed at the connection managed by
+ // r as they arrive. It is called by the protocol main loop.
+ // +checklocks:r.ep.mu
++// OutOfOrderSegments counts data segments that arrived ahead of a gap and
++// were queued for reassembly, across all endpoints — a diagnostic for
++// whether a peer's reorder reports reflect delivery order here.
++var OutOfOrderSegments atomic.Uint64
++
+ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err tcpip.Error) {
+ 	state := r.ep.EndpointState()
+ 	closed := r.ep.closed
+@@ -464,6 +470,28 @@ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err tcpip.Error) {
+ 	// This is according to RFC 793, page 68.
+ 	if !r.acceptable(segSeq, segLen) {
+ 		r.ep.snd.maybeSendOutOfWindowAck(s)
++		// A data segment that starts exactly at RCV.NXT fails the check
++		// only when our advertised window is zero. Its data cannot be
++		// queued, but the acknowledgment it carries is current, and it is
++		// the peer's retransmission of exactly this segment that keeps
++		// arriving while the window is closed. Dropping it wholesale means
++		// the sender never learns of the ACK: if the application is waiting
++		// on our own send side to make progress before it reads (an echo,
++		// a proxy), neither side can move and the connection wedges until
++		// something else opens the window. Linux (tcp_sequence) accepts a
++		// segment at rcv_nxt regardless of length, processes the ACK, and
++		// drops the data in tcp_data_queue; do the same by letting the
++		// caller hand the segment to the sender without consuming it here.
++		//
++		// The same goes for the peer's pure ACKs while our window is zero:
++		// once it has a segment in flight its SND.NXT is past our RCV.NXT,
++		// so every ACK it sends fails the check too. The sender validates
++		// acknowledgment numbers itself, so handing it the ACK is safe; the
++		// data, if any, is still not consumed.
++		if r.rcvWnd>>r.RcvWndScale == 0 && !segSeq.LessThan(r.RcvNxt) {
++			r.lastRcvdAckTime = s.rcvdTime
++			return false, nil
++		}
+ 		return true, nil
+ 	}
+ 
+@@ -506,6 +534,7 @@ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err tcpip.Error) {
+ 				r.PendingBufUsed += s.segMemSize()
+ 				r.ep.rcvQueueMu.Unlock()
+ 				s.IncRef()
++				OutOfOrderSegments.Add(1)
+ 				heap.Push(&r.pendingRcvdSegments, s)
+ 				UpdateSACKBlocks(&r.ep.sack, segSeq, segSeq.Add(segLen), r.RcvNxt)
+ 			}
+-- 
+2.43.0
+

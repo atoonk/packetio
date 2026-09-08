@@ -1,0 +1,222 @@
+From c494eaa999c29d533b2c71c1b0519dbeef749cf4 Mon Sep 17 00:00:00 2001
+From: Andree Toonk <andree@toonk.io>
+Date: Sun, 6 Sep 2026 19:16:07 +0000
+Subject: [PATCH 10/13] tcpip, tcp: trims on the connection-churn path
+
+tcpip.TrackDanglingEndpoints (off in the fork) is the sentry's save-time
+registry of closing endpoints, one global mutex twice per close. A sent
+segment that carries the delayed ACK stops the timer rather than orphaning
+it. A SACK scoreboard whose tree is built on the first SACK block, since
+most connections never carry one. MonotonicTime.Add and Sub as integer
+arithmetic.
+---
+ pkg/tcpip/tcpip.go                         | 23 ++++++++++---
+ pkg/tcpip/transport/tcp/sack_scoreboard.go | 39 +++++++++++++++++-----
+ pkg/tcpip/transport/tcp/timer.go           | 17 ++++++++++
+ 3 files changed, 66 insertions(+), 13 deletions(-)
+
+diff --git a/pkg/tcpip/tcpip.go b/pkg/tcpip/tcpip.go
+index de038f3..459db00 100644
+--- a/pkg/tcpip/tcpip.go
++++ b/pkg/tcpip/tcpip.go
+@@ -111,16 +111,19 @@ func (mt MonotonicTime) After(u MonotonicTime) bool {
+ 
+ // Add returns the monotonic clock reading mt+d.
+ func (mt MonotonicTime) Add(d time.Duration) MonotonicTime {
+-	return MonotonicTime{
+-		nanoseconds: time.Unix(0, mt.nanoseconds).Add(d).Sub(time.Unix(0, 0)).Nanoseconds(),
+-	}
++	// Plain integer arithmetic. Upstream goes through time.Unix(...).Add(d).Sub(...)
++	// for the same result, which costs ~40 ns per call and shows up in every
++	// TCP profile: this is called several times per segment (RTT, RACK, timers).
++	return MonotonicTime{nanoseconds: mt.nanoseconds + int64(d)}
+ }
+ 
+ // Sub returns the duration mt-u. If the result exceeds the maximum (or minimum)
+ // value that can be stored in a Duration, the maximum (or minimum) duration
+ // will be returned. To compute t-d for a duration d, use t.Add(-d).
+ func (mt MonotonicTime) Sub(u MonotonicTime) time.Duration {
+-	return time.Unix(0, mt.nanoseconds).Sub(time.Unix(0, u.nanoseconds))
++	// See Add. time.Duration saturates at ±292 years in upstream's form; a
++	// monotonic reading counted from a stack's start never gets there.
++	return time.Duration(mt.nanoseconds - u.nanoseconds)
+ }
+ 
+ // Milliseconds returns the time in milliseconds.
+@@ -2891,8 +2894,17 @@ func ReleaseDanglingEndpoints() {
+ 	}
+ }
+ 
++// TrackDanglingEndpoints keeps the registry of endpoints that are closing,
++// which the sentry walks on save. A stack that is never saved can turn it
++// off: every close otherwise takes one global mutex twice, shared by all
++// stacks in the process, at 60k closes a second.
++var TrackDanglingEndpoints = true
++
+ // AddDanglingEndpoint adds a dangling endpoint.
+ func AddDanglingEndpoint(e Endpoint) {
++	if !TrackDanglingEndpoints {
++		return
++	}
+ 	danglingEndpointsMu.Lock()
+ 	danglingEndpoints[e] = struct{}{}
+ 	danglingEndpointsMu.Unlock()
+@@ -2900,6 +2912,9 @@ func AddDanglingEndpoint(e Endpoint) {
+ 
+ // DeleteDanglingEndpoint removes a dangling endpoint.
+ func DeleteDanglingEndpoint(e Endpoint) {
++	if !TrackDanglingEndpoints {
++		return
++	}
+ 	danglingEndpointsMu.Lock()
+ 	delete(danglingEndpoints, e)
+ 	danglingEndpointsMu.Unlock()
+diff --git a/pkg/tcpip/transport/tcp/sack_scoreboard.go b/pkg/tcpip/transport/tcp/sack_scoreboard.go
+index 74713ec..d0d208e 100644
+--- a/pkg/tcpip/transport/tcp/sack_scoreboard.go
++++ b/pkg/tcpip/transport/tcp/sack_scoreboard.go
+@@ -59,21 +59,39 @@ type SACKScoreboard struct {
+ 
+ // NewSACKScoreboard returns a new SACK Scoreboard.
+ func NewSACKScoreboard(smss uint16, iss seqnum.Value) *SACKScoreboard {
++	// ranges is created on the first Insert: most connections never carry
++	// a SACK block, and a tree with its free list is the largest single
++	// allocation an endpoint makes.
+ 	return &SACKScoreboard{
+ 		smss:      smss,
+-		ranges:    btree.NewG[header.SACKBlock](defaultBtreeDegree, sackBlockLess),
+ 		maxSACKED: iss,
+ 	}
+ }
+ 
++// emptyRanges answers reads on a scoreboard that has no tree yet. It is
++// never written to.
++var emptyRanges = btree.NewG[header.SACKBlock](defaultBtreeDegree, sackBlockLess)
++
++// tree returns the ranges for reading: the scoreboard's own, or the shared
++// empty one.
++func (s *SACKScoreboard) tree() *btree.BTreeG[header.SACKBlock] {
++	if s.ranges == nil {
++		return emptyRanges
++	}
++	return s.ranges
++}
++
+ // Reset erases all known range information from the SACK scoreboard.
+ func (s *SACKScoreboard) Reset() {
+-	s.ranges = btree.NewG[header.SACKBlock](defaultBtreeDegree, sackBlockLess)
++	s.ranges = nil
+ 	s.sacked = 0
+ }
+ 
+ // Insert inserts/merges the provided SACKBlock into the scoreboard.
+ func (s *SACKScoreboard) Insert(r header.SACKBlock) {
++	if s.ranges == nil {
++		s.ranges = btree.NewG[header.SACKBlock](defaultBtreeDegree, sackBlockLess)
++	}
+ 	if s.ranges.Len() >= maxSACKBlocks {
+ 		return
+ 	}
+@@ -153,7 +171,7 @@ func (s *SACKScoreboard) IsSACKED(r header.SACKBlock) bool {
+ 	}
+ 
+ 	found := false
+-	s.ranges.DescendLessOrEqual(r, func(sacked header.SACKBlock) bool {
++	s.tree().DescendLessOrEqual(r, func(sacked header.SACKBlock) bool {
+ 		if sacked.End.LessThan(r.Start) {
+ 			return false
+ 		}
+@@ -170,7 +188,7 @@ func (s *SACKScoreboard) IsSACKED(r header.SACKBlock) bool {
+ func (s *SACKScoreboard) String() string {
+ 	var str strings.Builder
+ 	str.WriteString("SACKScoreboard: {")
+-	s.ranges.Ascend(func(sb header.SACKBlock) bool {
++	s.tree().Ascend(func(sb header.SACKBlock) bool {
+ 		fmt.Fprintf(&str, "%v,", sb)
+ 		return true
+ 	})
+@@ -180,13 +198,16 @@ func (s *SACKScoreboard) String() string {
+ 
+ // Delete removes all SACK information prior to seq.
+ func (s *SACKScoreboard) Delete(seq seqnum.Value) {
++	if s.ranges == nil {
++		return
++	}
+ 	if s.Empty() {
+ 		return
+ 	}
+ 	var toDelete []header.SACKBlock
+ 	var toInsert []header.SACKBlock
+ 	r := header.SACKBlock{seq, seq.Add(1)}
+-	s.ranges.DescendLessOrEqual(r, func(sb header.SACKBlock) bool {
++	s.tree().DescendLessOrEqual(r, func(sb header.SACKBlock) bool {
+ 		if sb == r {
+ 			return true
+ 		}
+@@ -210,7 +231,7 @@ func (s *SACKScoreboard) Delete(seq seqnum.Value) {
+ 
+ // Copy provides a copy of the SACK scoreboard.
+ func (s *SACKScoreboard) Copy() (sackBlocks []header.SACKBlock, maxSACKED seqnum.Value) {
+-	s.ranges.Ascend(func(sb header.SACKBlock) bool {
++	s.tree().Ascend(func(sb header.SACKBlock) bool {
+ 		sackBlocks = append(sackBlocks, sb)
+ 		return true
+ 	})
+@@ -233,7 +254,7 @@ func (s *SACKScoreboard) IsRangeLost(r header.SACKBlock) bool {
+ 	// We need to check if the immediate lower (if any) sacked
+ 	// range contains or partially overlaps with r.
+ 	searchMore := true
+-	s.ranges.DescendLessOrEqual(r, func(sacked header.SACKBlock) bool {
++	s.tree().DescendLessOrEqual(r, func(sacked header.SACKBlock) bool {
+ 		if sacked.Contains(r) {
+ 			searchMore = false
+ 			return false
+@@ -256,7 +277,7 @@ func (s *SACKScoreboard) IsRangeLost(r header.SACKBlock) bool {
+ 		return isLost
+ 	}
+ 
+-	s.ranges.AscendGreaterOrEqual(r, func(sacked header.SACKBlock) bool {
++	s.tree().AscendGreaterOrEqual(r, func(sacked header.SACKBlock) bool {
+ 		if sacked.Contains(r) {
+ 			return false
+ 		}
+@@ -285,7 +306,7 @@ func (s *SACKScoreboard) IsLost(seq seqnum.Value) bool {
+ 
+ // Empty returns true if the SACK scoreboard has no entries, false otherwise.
+ func (s *SACKScoreboard) Empty() bool {
+-	return s.ranges.Len() == 0
++	return s.tree().Len() == 0
+ }
+ 
+ // Sacked returns the current number of bytes held in the SACK scoreboard.
+diff --git a/pkg/tcpip/transport/tcp/timer.go b/pkg/tcpip/transport/tcp/timer.go
+index 7111789..57ac67e 100644
+--- a/pkg/tcpip/transport/tcp/timer.go
++++ b/pkg/tcpip/transport/tcp/timer.go
+@@ -131,6 +131,23 @@ func (t *timer) disable() {
+ 	}
+ }
+ 
++// stop disables the timer and stops the runtime timer under it, so that a
++// timer armed and disarmed on nearly every segment (the delayed ACK) does
++// not wake a goroutine and take the endpoint's lock for nothing when it
++// would have expired. The next enable re-arms the same runtime timer.
++func (t *timer) stop() {
++	if t.state == timerStateDisabled || t.state == timerUninitialized {
++		return
++	}
++	if t.timer != nil && !t.timer.Stop() {
++		// Too late: the callback is already on its way. Leave it an orphan
++		// to consume, as disable does, rather than let it find "expired".
++		t.state = timerStateOrphaned
++		return
++	}
++	t.state = timerStateDisabled
++}
++
+ // enabled returns true if the timer is currently enabled, false otherwise.
+ func (t *timer) enabled() bool {
+ 	return t.state == timerStateEnabled
+-- 
+2.43.0
+

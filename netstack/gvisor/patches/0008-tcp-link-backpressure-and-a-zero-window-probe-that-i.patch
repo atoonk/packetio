@@ -1,0 +1,627 @@
+From 36e7aaeaf08b46f0ecd0c624ca640b3567d927ef Mon Sep 17 00:00:00 2001
+From: Andree Toonk <andree@toonk.io>
+Date: Sun, 6 Sep 2026 19:16:07 +0000
+Subject: [PATCH 08/13] tcp: link backpressure, and a zero-window probe that is
+ not a loss
+
+tcp.LinkBackpressure treats a link's WouldBlock on write as "not sent, try
+again when told": the attempt is undone, the endpoint joins a per-stack
+line and stops sending; tcp.ResumeBlocked gives the line a turn each,
+tcp.LinkTurn segments, in order. Upstream advances SND.NXT whether or not
+the link took the segment, so a full link can only drop, and with 2000
+connections behind one queue the drops became RTO storms.
+tcp.SeparateZeroWindowProbe sends the probe on the retransmit timer
+without counting a timeout or collapsing the window. tcp.PreciseRTT
+measures the round trip from the local clock even when the peer echoes a
+TCP timestamp, which carries only milliseconds. tcp.ProcessorCount sets
+how many processor goroutines a stack starts. A sent segment that carries
+the delayed ACK disarms its timer.
+---
+ pkg/tcpip/transport/tcp/endpoint.go | 137 +++++++++++++++++
+ pkg/tcpip/transport/tcp/protocol.go |  17 ++-
+ pkg/tcpip/transport/tcp/snd.go      | 221 +++++++++++++++++++++++++---
+ 3 files changed, 353 insertions(+), 22 deletions(-)
+
+diff --git a/pkg/tcpip/transport/tcp/endpoint.go b/pkg/tcpip/transport/tcp/endpoint.go
+index d15ed83..eaf2fd4 100644
+--- a/pkg/tcpip/transport/tcp/endpoint.go
++++ b/pkg/tcpip/transport/tcp/endpoint.go
+@@ -575,6 +575,26 @@ type Endpoint struct {
+ 	// to complete the TCP shutdown.
+ 	closed bool
+ 
++	// inlineErr and inlineDeferred carry an error the inline fast path
++	// (dispatcher.go, InlineProcessing) could not act on to the processor.
++	inlineErr      tcpip.Error       `state:"nosave"`
++	inlineDeferred atomicbitops.Bool `state:"nosave"`
++	// blockedByLink is set while the link has refused this endpoint's
++	// segment and it waits on ResumeBlocked (see LinkBackpressure).
++	blockedByLink atomicbitops.Bool `state:"nosave"`
++	// linkRefused, under mu, records that the link refused the last send:
++	// ResumeBlocked stops at that endpoint, since the ones behind it would
++	// be refused too.
++	linkRefused bool `state:"nosave"`
++	// linkResuming, under mu, is set while ResumeBlocked runs this
++	// endpoint's turn: linkBlocked then only marks, and ResumeBlocked
++	// decides where in line the endpoint goes.
++	linkResuming bool `state:"nosave"`
++	// linkTurns, under mu, counts the turns ResumeBlocked gave this
++	// endpoint: one that never had any joins the front of the line, the
++	// way a fair queue lets a new flow's first packets through first.
++	linkTurns uint32 `state:"nosave"`
++
+ 	// txHash is the transport layer hash to be set on outbound packets
+ 	// emitted by this endpoint.
+ 	txHash uint32
+@@ -1212,6 +1232,7 @@ func (e *Endpoint) cleanupLocked() {
+ 		e.snd.probeTimer.cleanup()
+ 		e.snd.reorderTimer.cleanup()
+ 		e.snd.corkTimer.cleanup()
++		e.snd.delayedAckTimer.cleanup()
+ 	}
+ 
+ 	if e.finWait2Timer != nil {
+@@ -1692,6 +1713,49 @@ func (e *Endpoint) queueSegment(p tcpip.Payloader, opts tcpip.WriteOptions) (*se
+ //
+ // +checklocksexclude:e.segmentQueue.mu
+ // +checklocksexclude:e.pendingProcessingMu
++// WriteExternal queues vs — payload that already lives in memory the caller
++// owns (buffer.NewViewFromExternal) — without copying it, as one segment,
++// and sends what the window allows. Handing it a GSO packet's worth of views
++// at a time keeps the per-segment work of the send path per packet. It is
++// all or nothing: if the send buffer cannot take every view it returns
++// ErrWouldBlock and the caller keeps them; otherwise the endpoint owns them
++// from here, and each view's release runs once the peer has acknowledged
++// every byte and the link has let go of every clone.
++func (e *Endpoint) WriteExternal(vs []*buffer.View) (int64, tcpip.Error) {
++	e.LockUser()
++	defer e.UnlockUser()
++
++	size := 0
++	for _, v := range vs {
++		size += v.Size()
++	}
++	if size == 0 {
++		return 0, nil
++	}
++	e.sndQueueInfo.sndQueueMu.Lock()
++	avail, err := e.isEndpointWritableLocked()
++	if err != nil {
++		e.sndQueueInfo.sndQueueMu.Unlock()
++		e.stats.WriteErrors.WriteClosed.Increment()
++		return 0, err
++	}
++	if avail < size {
++		e.sndQueueInfo.sndQueueMu.Unlock()
++		return 0, &tcpip.ErrWouldBlock{}
++	}
++	buf := buffer.MakeWithView(vs[0])
++	for _, v := range vs[1:] {
++		buf.Append(v) // external views read as shared, so this links, never copies
++	}
++	s := newOutgoingSegment(e.TransportEndpointInfo.ID, e.stack.Clock(), buf, e.ops.GetMark())
++	e.sndQueueInfo.SndBufUsed += size
++	e.snd.writeList.PushBack(s)
++	e.sndQueueInfo.sndQueueMu.Unlock()
++
++	e.sendData(s)
++	return int64(size), nil
++}
++
+ func (e *Endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcpip.Error) {
+ 	// Linux completely ignores any address passed to sendto(2) for TCP sockets
+ 	// (without the MSG_FASTOPEN flag). Corking is unimplemented, so opts.More
+@@ -3490,3 +3554,76 @@ func (e *Endpoint) getExperimentOptionValue(route *stack.Route) uint16 {
+ 	}
+ 	return 0
+ }
++
++// linkBlocked records that the link refused this endpoint's last segment
++// (see LinkBackpressure) and queues it for ResumeBlocked.
++//
++// +checklocks:e.mu
++func (e *Endpoint) linkBlocked() {
++	if e.blockedByLink.CompareAndSwap(false, true) && !e.linkResuming {
++		e.protocol.blockedMu.Lock()
++		if e.linkTurns == 0 {
++			e.protocol.blocked = append([]*Endpoint{e}, e.protocol.blocked...)
++		} else {
++			e.protocol.blocked = append(e.protocol.blocked, e)
++		}
++		e.protocol.blockedMu.Unlock()
++	}
++}
++
++// ResumeBlocked gives the endpoints the link refused, in the order it
++// refused them, a turn to send (LinkTurn segments each) and stops at the
++// first the link refuses again, leaving it and the rest in line. The link
++// calls it, with no stack lock held, whenever its backlog has room.
++func ResumeBlocked(s *stack.Stack) {
++	p, ok := s.TransportProtocolInstance(ProtocolNumber).(*protocol)
++	if !ok {
++		return
++	}
++	p.blockedMu.Lock()
++	eps := p.blocked
++	if len(eps) == 0 {
++		p.blockedMu.Unlock()
++		return
++	}
++	p.blocked = nil
++	p.blockedMu.Unlock()
++	for i, ep := range eps {
++		ep.mu.Lock()
++		ep.blockedByLink.Store(false)
++		ep.linkRefused = false
++		ep.linkResuming = true
++		if ep.EndpointState().connected() && ep.snd != nil {
++			// The turn is bounded only while others wait; alone, it may
++			// send until the link refuses.
++			p.blockedMu.Lock()
++			others := i+1 < len(eps) || len(p.blocked) > 0
++			p.blockedMu.Unlock()
++			if others {
++				ep.snd.linkTurn = LinkTurn
++			}
++			ep.snd.sendData()
++			ep.snd.linkTurn = 0
++			ep.linkTurns++
++		}
++		ep.linkResuming = false
++		refused, blocked := ep.linkRefused, ep.blockedByLink.Load()
++		ep.mu.Unlock()
++		switch {
++		case refused:
++			// The link is full again: this endpoint and the rest keep
++			// their places, ahead of anyone who joined the line meanwhile.
++			p.blockedMu.Lock()
++			rest := make([]*Endpoint, 0, len(eps)-i+len(p.blocked))
++			rest = append(rest, eps[i:]...)
++			p.blocked = append(rest, p.blocked...)
++			p.blockedMu.Unlock()
++			return
++		case blocked:
++			// Its turn is used up and it has more: back to the end.
++			p.blockedMu.Lock()
++			p.blocked = append(p.blocked, ep)
++			p.blockedMu.Unlock()
++		}
++	}
++}
+diff --git a/pkg/tcpip/transport/tcp/protocol.go b/pkg/tcpip/transport/tcp/protocol.go
+index 18ff8f4..b3f4801 100644
+--- a/pkg/tcpip/transport/tcp/protocol.go
++++ b/pkg/tcpip/transport/tcp/protocol.go
+@@ -19,6 +19,7 @@ import (
+ 	"crypto/sha256"
+ 	"encoding/binary"
+ 	"fmt"
++	"gvisor.dev/gvisor/pkg/sync"
+ 	"runtime"
+ 	"strings"
+ 	"time"
+@@ -125,6 +126,10 @@ type protocol struct {
+ 	synRetries uint8
+ 
+ 	dispatcher dispatcher
++	// blocked holds endpoints a link refused (LinkBackpressure) until
++	// ResumeBlocked.
++	blockedMu sync.Mutex
++	blocked   []*Endpoint
+ 
+ 	// probe, if not nil, will be invoked any time an endpoint receives a
+ 	// TCP segment.
+@@ -623,10 +628,20 @@ func newProtocol(s *stack.Stack, cc string, probe TCPProbeFunc) stack.TransportP
+ 		tsOffsetSecret:             tsOffsetSecret,
+ 		probe:                      probe,
+ 	}
+-	p.dispatcher.init(s.InsecureRNG(), runtime.GOMAXPROCS(0))
++	n := runtime.GOMAXPROCS(0)
++	if ProcessorCount > 0 {
++		n = ProcessorCount
++	}
++	p.dispatcher.init(s.InsecureRNG(), n)
+ 	return &p
+ }
+ 
++// ProcessorCount, when positive, is the number of TCP processor goroutines a
++// new stack starts instead of GOMAXPROCS. A process running one stack per NIC
++// queue with inline segment processing needs only a fallback processor per
++// stack, not GOMAXPROCS of them each.
++var ProcessorCount int
++
+ // protocolFromStack retrieves the tcp.protocol instance from stack s.
+ func protocolFromStack(s *stack.Stack) *protocol {
+ 	return s.TransportProtocolInstance(ProtocolNumber).(*protocol)
+diff --git a/pkg/tcpip/transport/tcp/snd.go b/pkg/tcpip/transport/tcp/snd.go
+index b9227e0..49acfd0 100644
+--- a/pkg/tcpip/transport/tcp/snd.go
++++ b/pkg/tcpip/transport/tcp/snd.go
+@@ -60,6 +60,41 @@ const (
+ 	unknownRTT = time.Duration(-1)
+ )
+ 
++// LinkBackpressure makes a link endpoint's WouldBlock on write mean "not
++// sent, ask again": the segment is left unsent with SND.NXT unchanged and
++// the endpoint is queued for ResumeBlocked, instead of upstream's counting
++// it sent and recovering it by timer. It is how a bounded transmit backlog
++// (a per-socket queue limit, like Linux's TCP small queues) pushes back into
++// the sender rather than turning overload into loss.
++// SeparateZeroWindowProbe keeps a zero-window probe off the loss path: it is
++// still sent on the retransmit timer and backed off the same way, but it is
++// not counted as a timeout and does not collapse the congestion window or
++// reset the scoreboard. See retransmitTimerExpired.
++var SeparateZeroWindowProbe = true
++
++var LinkBackpressure bool
++
++// LinkTurn is how many segments an endpoint the link had refused may send
++// when the link resumes it (ResumeBlocked) before it goes back to the end of
++// the line, so that a full link is shared round-robin rather than by whoever
++// has the largest window. A segment here is a GSO packet of up to 64 KiB,
++// so one is already twenty times fq's quantum of two MTUs; with 500
++// connections in a queue's line, one segment each is an 11 ms round, two
++// is 22, and a keep-alive request's first byte waits about half a round.
++// Zero means no limit.
++var LinkTurn = 1
++
++// PreciseRTT makes the sender measure the round trip from its own clock (the
++// ACK's ingress time against the segment's send time) even when the peer
++// echoes a TCP timestamp. That option carries milliseconds, so on a
++// sub-millisecond path every sample taken from it reads as 0 or 1 ms: SRTT
++// settles at ~1 ms whatever the path really is, and congestion control —
++// whose window growth is per round trip — then behaves as if the link were
++// ten or twenty times longer than it is. Linux prefers the clock sample for
++// the same reason; upstream's guard here skips it whenever the timestamp
++// option is present.
++var PreciseRTT = true
++
+ // congestionControl is an interface that must be implemented by any supported
+ // congestion control algorithm.
+ type congestionControl interface {
+@@ -131,6 +166,10 @@ type sender struct {
+ 	// written, i.e. the first payload starting at SND.NXT.
+ 	writeNext *segment
+ 
++	// linkTurn, while ResumeBlocked runs sendData, is the segments this
++	// turn may send (see LinkTurn).
++	linkTurn int `state:"nosave"`
++
+ 	// writeList holds all writable data: both unsent data and
+ 	// sent-but-unacknowledged data. Alternatively: it holds all bytes
+ 	// starting from SND.UNA.
+@@ -190,6 +229,10 @@ type sender struct {
+ 	// corkTimer is used to drain the segments which are held when TCP_CORK
+ 	// option is enabled.
+ 	corkTimer timer `state:"nosave"`
++
++	// delayedAckTimer sends the ACK that handleSegmentsLocked held back in
++	// the hope that outgoing data would carry it. See DelayedACKTimeout.
++	delayedAckTimer timer `state:"nosave"`
+ }
+ 
+ // protectedWriteList wraps the write list, checking for invalid state when
+@@ -304,6 +347,7 @@ func initSender(ep *Endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uin
+ 	ep.snd.reorderTimer.init(ep.snd.ep.stack.Clock(), timerHandler(ep.snd.ep, ep.snd.rc.reorderTimerExpired))
+ 	ep.snd.probeTimer.init(ep.snd.ep.stack.Clock(), timerHandler(ep.snd.ep, ep.snd.probeTimerExpired))
+ 	ep.snd.corkTimer.init(ep.snd.ep.stack.Clock(), timerHandler(ep.snd.ep, ep.snd.corkTimerExpired))
++	ep.snd.delayedAckTimer.init(ep.snd.ep.stack.Clock(), timerHandler(ep.snd.ep, ep.snd.delayedAckTimerExpired))
+ 
+ 	ep.snd.updateMaxPayloadSize(int(ep.snd.ep.route.MTU()), 0)
+ 	// Initialize SACK Scoreboard after updating max payload size as we use
+@@ -527,9 +571,12 @@ func (s *sender) resendSegment() {
+ 		// to the highest sequence number in the retransmitted segment.
+ 		s.FastRecovery.HighRxt = seg.sequenceNumber.Add(seqnum.Size(seg.payloadSize())) - 1
+ 		s.FastRecovery.RescueRxt = seg.sequenceNumber.Add(seqnum.Size(seg.payloadSize())) - 1
+-		s.sendSegment(seg)
+-		s.ep.stack.Stats().TCP.FastRetransmit.Increment()
+-		s.ep.stats.SendErrors.FastRetransmit.Increment()
++		if err := s.sendSegment(seg); err == nil || !LinkBackpressure {
++			// A retransmit the link refused was not sent; sendSegment
++			// undid it, and it is not counted here either.
++			s.ep.stack.Stats().TCP.FastRetransmit.Increment()
++			s.ep.stats.SendErrors.FastRetransmit.Increment()
++		}
+ 
+ 		// Run SetPipe() as per RFC 6675 section 5 Step 4.4
+ 		s.SetPipe()
+@@ -563,8 +610,18 @@ func (s *sender) retransmitTimerExpired() tcpip.Error {
+ 		return nil
+ 	}
+ 
+-	s.ep.stack.Stats().TCP.Timeouts.Increment()
+-	s.ep.stats.SendErrors.Timeouts.Increment()
++	// A peer that has stopped reading is not a loss: with
++	// SeparateZeroWindowProbe the probe is sent below without counting a
++	// timeout, collapsing the congestion window or resetting the SACK
++	// scoreboard. Linux keeps window probes on their own timer for exactly
++	// this reason; merged, every slow reader looks like loss, and a server
++	// holding thousands of them restarts each from a minimal window every
++	// time its reader pauses.
++	zwp := SeparateZeroWindowProbe && s.zeroWindowProbing
++	if !zwp {
++		s.ep.stack.Stats().TCP.Timeouts.Increment()
++		s.ep.stats.SendErrors.Timeouts.Increment()
++	}
+ 
+ 	// Set TLPRxtOut to false according to
+ 	// https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.6.1.
+@@ -612,6 +669,12 @@ func (s *sender) retransmitTimerExpired() tcpip.Error {
+ 		s.RTO = remaining
+ 	}
+ 
++	if zwp {
++		// sendZeroWindowProbe re-arms the timer with the backed-off RTO.
++		s.sendZeroWindowProbe()
++		return nil
++	}
++
+ 	// See: https://tools.ietf.org/html/rfc6582#section-3.2 Step 4.
+ 	//
+ 	// Retransmit timeouts:
+@@ -913,15 +976,14 @@ func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value) (se
+ 	}
+ 
+ 	var segEnd seqnum.Value
++	sendingFin := false
+ 	if seg.payloadSize() == 0 {
+ 		if s.writeList.Back() != seg {
+ 			panic("FIN segments must be the final segment in the write list.")
+ 		}
+ 		seg.flags = header.TCPFlagAck | header.TCPFlagFin
+ 		segEnd = seg.sequenceNumber.Add(1)
+-		// FIN is now being transmitted; mark it so the receiver can tell
+-		// a data-only ACK apart from one that acknowledges our FIN.
+-		s.finSent = true
++		sendingFin = true
+ 	} else {
+ 		// We're sending a non-FIN segment.
+ 		if seg.flags&header.TCPFlagFin != 0 {
+@@ -998,7 +1060,25 @@ func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value) (se
+ 		panic("attempted to send segment not in write list")
+ 	}
+ 
+-	s.sendSegment(seg)
++	if err := s.sendSegment(seg); err != nil && LinkBackpressure {
++		if _, ok := err.(*tcpip.ErrWouldBlock); ok {
++			// The link has no room and kept nothing: this segment was not
++			// sent (sendSegment already undid its bookkeeping). Stop, and
++			// join the line; the link says when to try again
++			// (ResumeBlocked), and so does the next ACK.
++			s.ep.linkRefused = true
++			s.ep.linkBlocked()
++			return false
++		}
++	}
++
++	// The segment left: a FIN in it is now transmitted, so the receiver may
++	// tell a data-only ACK apart from one that acknowledges our FIN. Set
++	// after the send, never before: a FIN the link refused was not sent,
++	// and SND.NXT below did not move for it either.
++	if sendingFin {
++		s.finSent = true
++	}
+ 
+ 	// Update sndNxt if we actually sent new data (as opposed to
+ 	// retransmitting some previously sent data).
+@@ -1027,7 +1107,13 @@ func (s *sender) sendZeroWindowProbe() {
+ 		Mark:    s.ep.ops.GetMark(),
+ 	})
+ 	defer pkt.DecRef()
+-	s.sendSegmentFromPacketBuffer(pkt, header.TCPFlagAck, s.SndUna-1)
++	if err := s.sendSegmentFromPacketBuffer(pkt, header.TCPFlagAck, s.SndUna-1); err != nil && LinkBackpressure {
++		if _, ok := err.(*tcpip.ErrWouldBlock); ok {
++			// A probe the link refused was not sent and must not count
++			// toward the retries that give the connection up.
++			s.unackZeroWindowProbes--
++		}
++	}
+ 
+ 	// Rearm the timer to continue probing.
+ 	s.resendTimer.enable(s.RTO)
+@@ -1092,6 +1178,11 @@ func (s *sender) postXmit(dataSent bool, shouldScheduleProbe bool) {
+ // +checklocks:s.ep.mu
+ // +checklocksexclude:s.rtt.rttMutex
+ func (s *sender) sendData() {
++	if LinkBackpressure && s.ep.blockedByLink.Load() {
++		// The link refused the next segment and has not said it has room
++		// yet (ResumeBlocked): trying on every ACK would only be refused.
++		return
++	}
+ 	limit := s.MaxPayloadSize
+ 	if s.gso {
+ 		limit = int(s.ep.gso.MaxSize - header.TCPTotalHeaderMaximumSize - 1)
+@@ -1109,7 +1200,13 @@ func (s *sender) sendData() {
+ 	}
+ 
+ 	var dataSent bool
++	sentThisTurn := 0
+ 	for seg := s.writeNext; seg != nil && s.Outstanding < s.SndCwnd; seg = seg.Next() {
++		if s.linkTurn > 0 && sentThisTurn >= s.linkTurn {
++			// The turn is used up and more is waiting: back in line.
++			s.ep.linkBlocked()
++			break
++		}
+ 		// NOTE(gvisor.dev/issue/11632): Use uint64 to avoid overflow.
+ 		cwndLimit := uint64(s.SndCwnd-s.Outstanding) * uint64(s.MaxPayloadSize)
+ 		if cwndLimit < uint64(limit) {
+@@ -1125,6 +1222,7 @@ func (s *sender) sendData() {
+ 			break
+ 		}
+ 		dataSent = true
++		sentThisTurn++
+ 		s.Outstanding += s.pCount(seg, s.MaxPayloadSize)
+ 		s.updateWriteNext(seg.Next())
+ 	}
+@@ -1542,7 +1640,7 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
+ 	// ACK was delayed inside the stack before being processed (e.g. queued while
+ 	// the application held the endpoint lock during a Write), using the
+ 	// processing time would inflate the RTT sample and thus SRTT/RTO.
+-	if !rcvdSeg.parsedOptions.TS && s.RTTMeasureSeqNum.LessThan(rcvdSeg.ackNumber) {
++	if (PreciseRTT || !rcvdSeg.parsedOptions.TS) && s.RTTMeasureSeqNum.LessThan(rcvdSeg.ackNumber) {
+ 		bestRTT = rcvdSeg.rcvdTime.Sub(s.RTTMeasureTime)
+ 		s.updateRTO(bestRTT)
+ 		s.RTTMeasureSeqNum = s.SndNxt
+@@ -1650,7 +1748,13 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
+ 			// clock, so an ACK delayed inside the stack before processing does
+ 			// not inflate the timestamp-based RTT sample (and thus SRTT/RTO).
+ 			tsRTT := s.ep.elapsed(rcvdSeg.rcvdTime, rcvdSeg.parsedOptions.TSEcr)
+-			s.updateRTO(tsRTT)
++			if bestRTT == unknownRTT {
++				// Only when the clock gave us nothing: the echoed
++				// timestamp carries milliseconds, and feeding a
++				// quantised sample into SRTT/RTO on a fast path
++				// undoes the precise one taken above.
++				s.updateRTO(tsRTT)
++			}
+ 			// Following Linux, prefer RTT computed from ACKs to TSEcr because,
+ 			// "broken middle-boxes or peers may corrupt TS-ECR fields"
+ 			// https://github.com/torvalds/linux/blob/39cd87c4eb2b893354f3b850f916353f2658ae6f/net/ipv4/tcp_input.c#L3141C1-L3144C24
+@@ -1811,18 +1915,30 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
+ // sendSegment sends the specified segment.
+ // +checklocks:s.ep.mu
+ func (s *sender) sendSegment(seg *segment) tcpip.Error {
+-	if seg.xmitCount > 0 {
++	retransmit := seg.xmitCount > 0
++	xmitTime, xmitCount, lost := seg.xmitTime, seg.xmitCount, seg.lost
++	seg.xmitTime = s.ep.stack.Clock().NowMonotonic()
++	seg.xmitCount++
++	seg.lost = false
++
++	err := s.sendSegmentFromPacketBuffer(seg.pkt, seg.flags, seg.sequenceNumber)
++	if err != nil && LinkBackpressure {
++		if _, ok := err.(*tcpip.ErrWouldBlock); ok {
++			// Refused, not lost: the segment never left, so its send time
++			// and count go back to what they were (RACK times losses by
++			// them), and no timer or counter records an attempt. This
++			// covers every caller — new data, fast retransmits, probes.
++			seg.xmitTime, seg.xmitCount, seg.lost = xmitTime, xmitCount, lost
++			return err
++		}
++	}
++	if retransmit {
+ 		s.ep.stack.Stats().TCP.Retransmits.Increment()
+ 		s.ep.stats.SendErrors.Retransmits.Increment()
+ 		if s.SndCwnd < s.Ssthresh {
+ 			s.ep.stack.Stats().TCP.SlowStartRetransmits.Increment()
+ 		}
+ 	}
+-	seg.xmitTime = s.ep.stack.Clock().NowMonotonic()
+-	seg.xmitCount++
+-	seg.lost = false
+-
+-	err := s.sendSegmentFromPacketBuffer(seg.pkt, seg.flags, seg.sequenceNumber)
+ 
+ 	// Every time a packet containing data is sent (including a
+ 	// retransmission), if SACK is enabled and we are retransmitting data
+@@ -1845,6 +1961,9 @@ func (s *sender) sendSegment(seg *segment) tcpip.Error {
+ // flags and sequence number.
+ // +checklocks:s.ep.mu
+ func (s *sender) sendSegmentFromPacketBuffer(pkt *stack.PacketBuffer, flags header.TCPFlags, seq seqnum.Value) tcpip.Error {
++	lastSendTime, rttMeasureTime, maxSentAck := s.LastSendTime, s.RTTMeasureTime, s.MaxSentAck
++	delayedACKArmed := DelayedACKTimeout > 0 && s.delayedAckTimer.enabled()
++
+ 	s.LastSendTime = s.ep.stack.Clock().NowMonotonic()
+ 	if seq == s.RTTMeasureSeqNum {
+ 		s.RTTMeasureTime = s.LastSendTime
+@@ -1854,18 +1973,32 @@ func (s *sender) sendSegmentFromPacketBuffer(pkt *stack.PacketBuffer, flags head
+ 
+ 	// Remember the max sent ack.
+ 	s.MaxSentAck = rcvNxt
++	s.ackCarried()
+ 
+ 	// We need to clone the packet because sendRaw takes ownership of pkt,
+ 	// and pkt could be reprocessed later on (i.e retrasmission).
+ 	pkt = pkt.Clone()
+ 	defer pkt.DecRef()
+ 
+-	return s.ep.sendRaw(pkt, flags, seq, rcvNxt, rcvWnd)
++	err := s.ep.sendRaw(pkt, flags, seq, rcvNxt, rcvWnd)
++	if err != nil && LinkBackpressure {
++		if _, ok := err.(*tcpip.ErrWouldBlock); ok {
++			// Nothing left this host: it carried no ACK and set no time.
++			s.LastSendTime, s.RTTMeasureTime, s.MaxSentAck = lastSendTime, rttMeasureTime, maxSentAck
++			if delayedACKArmed && !s.delayedAckTimer.enabled() {
++				s.delayedAckTimer.enable(DelayedACKTimeout)
++			}
++		}
++	}
++	return err
+ }
+ 
+ // sendEmptySegment sends a new empty segment, flags and sequence number.
+ // +checklocks:s.ep.mu
+ func (s *sender) sendEmptySegment(flags header.TCPFlags, seq seqnum.Value) tcpip.Error {
++	lastSendTime, rttMeasureTime, maxSentAck := s.LastSendTime, s.RTTMeasureTime, s.MaxSentAck
++	delayedACKArmed := DelayedACKTimeout > 0 && s.delayedAckTimer.enabled()
++
+ 	s.LastSendTime = s.ep.stack.Clock().NowMonotonic()
+ 	if seq == s.RTTMeasureSeqNum {
+ 		s.RTTMeasureTime = s.LastSendTime
+@@ -1875,8 +2008,21 @@ func (s *sender) sendEmptySegment(flags header.TCPFlags, seq seqnum.Value) tcpip
+ 
+ 	// Remember the max sent ack.
+ 	s.MaxSentAck = rcvNxt
+-
+-	return s.ep.sendEmptyRaw(flags, seq, rcvNxt, rcvWnd)
++	s.ackCarried()
++
++	err := s.ep.sendEmptyRaw(flags, seq, rcvNxt, rcvWnd)
++	if err != nil && LinkBackpressure {
++		if _, ok := err.(*tcpip.ErrWouldBlock); ok {
++			// Not sent: it carried no ACK. (A link that pushes back is
++			// expected to let pure ACKs through; this keeps the books
++			// right if one does not.)
++			s.LastSendTime, s.RTTMeasureTime, s.MaxSentAck = lastSendTime, rttMeasureTime, maxSentAck
++			if delayedACKArmed && !s.delayedAckTimer.enabled() {
++				s.delayedAckTimer.enable(DelayedACKTimeout)
++			}
++		}
++	}
++	return err
+ }
+ 
+ // maybeSendOutOfWindowAck sends an ACK if we are not being rate limited
+@@ -1900,6 +2046,39 @@ func (s *sender) updateWriteNext(seg *segment) {
+ 	s.writeNext = seg
+ }
+ 
++// DelayedACKTimeout, when nonzero, lets an endpoint hold a pure ACK for that
++// long after processing inbound data, provided less than two MSS is
++// unacknowledged (RFC 5681 section 4.2), so that a reply written in the
++// meantime carries the acknowledgment instead of a frame of its own. Upstream
++// netstack has no delayed ACK: every inbound batch is answered with a bare ACK
++// at once, which for a request/response server is a second frame per
++// request. Zero keeps that behaviour.
++var DelayedACKTimeout time.Duration
++
++// ackCarried disarms the delayed-ACK timer once a segment has carried the
++// acknowledgement it was holding: a server that answers every request
++// within microseconds would otherwise pay a timer goroutine wakeup, an
++// endpoint lock and a no-op check per request, a millisecond later.
++//
++// +checklocks:s.ep.mu
++func (s *sender) ackCarried() {
++	if DelayedACKTimeout > 0 && s.delayedAckTimer.enabled() {
++		s.delayedAckTimer.stop()
++	}
++}
++
++// delayedAckTimerExpired sends the held ACK if nothing else has carried it.
++// +checklocks:s.ep.mu
++func (s *sender) delayedAckTimerExpired() tcpip.Error {
++	if s.delayedAckTimer.isUninitialized() || !s.delayedAckTimer.checkExpiration() {
++		return nil
++	}
++	if s.ep.rcv != nil && s.ep.rcv.RcvNxt != s.MaxSentAck {
++		s.sendAck()
++	}
++	return nil
++}
++
+ // corkTimerExpired drains all the segments when TCP_CORK is enabled.
+ // +checklocks:s.ep.mu
+ // +checklocksexclude:s.rtt.rttMutex
+-- 
+2.43.0
+

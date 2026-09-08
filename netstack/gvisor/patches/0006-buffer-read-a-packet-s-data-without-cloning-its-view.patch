@@ -1,0 +1,88 @@
+From ad09b8f91457db9b0c434b8aa259c324d8c0e633 Mon Sep 17 00:00:00 2001
+From: Andree Toonk <andree@toonk.io>
+Date: Sun, 6 Sep 2026 19:16:07 +0000
+Subject: [PATCH 06/13] buffer: read a packet's data without cloning its views
+
+Buffer.SubSlices walks views without cloning; PacketData.ReadTo uses it.
+The application's read cloned and released every view it handed out.
+Also fixes PacketData.ChecksumAtOffset to add the packet's data offset, as
+PullUp does: GRO's own checksum check read the wrong bytes once a link
+header was consumed, so it never merged anything.
+---
+ pkg/buffer/buffer.go             | 21 +++++++++++++++++++++
+ pkg/tcpip/stack/packet_buffer.go | 12 +++++++-----
+ 2 files changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/pkg/buffer/buffer.go b/pkg/buffer/buffer.go
+index 0f352c0..215e8bf 100644
+--- a/pkg/buffer/buffer.go
++++ b/pkg/buffer/buffer.go
+@@ -441,6 +441,27 @@ func (b *Buffer) Apply(fn func(*View)) {
+ 
+ // SubApply applies fn to a given range of data in b. Any part of the range
+ // outside of b is ignored.
++// SubSlices calls fn on each view's bytes within the range [offset,
++// offset+length), in order, without cloning the views. Unlike SubApply the
++// slices are only valid during fn, and the buffer must not be modified
++// from fn. It is the read path's iterator: a clone and a release per view
++// for every read was a tenth of a 100G receive profile.
++func (b *Buffer) SubSlices(offset, length int, fn func([]byte)) {
++	for v := b.data.Front(); length > 0 && v != nil; v = v.Next() {
++		if offset >= v.Size() {
++			offset -= v.Size()
++			continue
++		}
++		p := v.AsSlice()[offset:]
++		offset = 0
++		if len(p) > length {
++			p = p[:length]
++		}
++		fn(p)
++		length -= len(p)
++	}
++}
++
+ func (b *Buffer) SubApply(offset, length int, fn func(*View)) {
+ 	for v := b.data.Front(); length > 0 && v != nil; v = v.Next() {
+ 		if offset >= v.Size() {
+diff --git a/pkg/tcpip/stack/packet_buffer.go b/pkg/tcpip/stack/packet_buffer.go
+index 4020439..2877f3d 100644
+--- a/pkg/tcpip/stack/packet_buffer.go
++++ b/pkg/tcpip/stack/packet_buffer.go
+@@ -639,18 +639,18 @@ func (d PacketData) ReadTo(dst io.Writer, peek bool) (int, error) {
+ 		done int
+ 	)
+ 	offset := d.pk.dataOffset()
+-	d.pk.buf.SubApply(offset, int(d.pk.buf.Size())-offset, func(v *buffer.View) {
++	d.pk.buf.SubSlices(offset, int(d.pk.buf.Size())-offset, func(p []byte) {
+ 		if err != nil {
+ 			return
+ 		}
+ 		var n int
+-		n, err = dst.Write(v.AsSlice())
++		n, err = dst.Write(p)
+ 		done += n
+ 		if err != nil {
+ 			return
+ 		}
+-		if n != v.Size() {
+-			panic(fmt.Sprintf("io.Writer.Write succeeded with incomplete write: %d != %d", n, v.Size()))
++		if n != len(p) {
++			panic(fmt.Sprintf("io.Writer.Write succeeded with incomplete write: %d != %d", n, len(p)))
+ 		}
+ 	})
+ 	if !peek {
+@@ -755,7 +755,9 @@ func (d PacketData) Checksum() uint16 {
+ // ChecksumAtOffset returns a checksum over the data payload of the packet
+ // starting from offset.
+ func (d PacketData) ChecksumAtOffset(offset int) uint16 {
+-	return d.pk.buf.Checksum(offset)
++	// offset is relative to the data, as PullUp's is; the buffer also holds
++	// the reserved header space and any consumed link header in front of it.
++	return d.pk.buf.Checksum(d.pk.dataOffset() + offset)
+ }
+ 
+ // Range represents a contiguous subportion of a PacketBuffer.
+-- 
+2.43.0
+

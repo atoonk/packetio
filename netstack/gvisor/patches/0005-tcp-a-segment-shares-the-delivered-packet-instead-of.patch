@@ -1,0 +1,53 @@
+From ced28c40919a4559aef68979c9ef675403d97c80 Mon Sep 17 00:00:00 2001
+From: Andree Toonk <andree@toonk.io>
+Date: Sun, 6 Sep 2026 19:16:07 +0000
+Subject: [PATCH 05/13] tcp: a segment shares the delivered packet instead of
+ cloning it
+
+newIncomingSegment takes a reference to the delivered packet;
+tcp.ClonePacketForSegment restores upstream. After GRO a packet is about
+35 views, and cloning them was 10% of the receive profile at 100G. The
+caller drops its reference on return and never touches the packet again.
+---
+ pkg/tcpip/transport/tcp/segment.go | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/tcpip/transport/tcp/segment.go b/pkg/tcpip/transport/tcp/segment.go
+index dee7cbd..108007d 100644
+--- a/pkg/tcpip/transport/tcp/segment.go
++++ b/pkg/tcpip/transport/tcp/segment.go
+@@ -92,6 +92,10 @@ type segment struct {
+ 	lost bool
+ }
+ 
++// ClonePacketForSegment restores upstream's behaviour of cloning the
++// delivered packet into the segment (see newIncomingSegment).
++var ClonePacketForSegment = false
++
+ func newIncomingSegment(id stack.TransportEndpointID, clock tcpip.Clock, pkt *stack.PacketBuffer) (*segment, error) {
+ 	hdr := header.TCP(pkt.TransportHeader().Slice())
+ 	var srcAddr tcpip.Address
+@@ -130,7 +134,19 @@ func newIncomingSegment(id stack.TransportEndpointID, clock tcpip.Clock, pkt *st
+ 	s.window = seqnum.Size(hdr.WindowSize())
+ 	s.rcvdTime = clock.NowMonotonic()
+ 	s.dataMemSize = pkt.MemSize()
+-	s.pkt = pkt.Clone()
++	if ClonePacketForSegment {
++		s.pkt = pkt.Clone()
++	} else {
++		// Take a reference to the delivered packet rather than clone its
++		// view list: after GRO a packet is dozens of views, and the clone
++		// (a pool get and a reference increment per view, and the same
++		// again to release the original) was a tenth of the receive
++		// profile at 100G. The caller drops its reference when delivery
++		// returns and never touches the packet again, so sharing it is
++		// safe; what the segment does to it later (trimming as it is
++		// read) it would have done to its clone.
++		s.pkt = pkt.IncRef()
++	}
+ 	s.csumValid = csumValid
+ 
+ 	if !s.pkt.RXChecksumValidated {
+-- 
+2.43.0
+

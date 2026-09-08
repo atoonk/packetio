@@ -1,0 +1,88 @@
+From d6b22bc6849f7a5540298fb3cc3883efca0c5dae Mon Sep 17 00:00:00 2001
+From: Andree Toonk <andree@toonk.io>
+Date: Sun, 6 Sep 2026 19:16:07 +0000
+Subject: [PATCH 03/13] buffer: do not zero a pooled chunk on reuse
+
+buffer.ZeroOnReuse, default off. Every user of a fresh view writes it
+before anything reads it, so upstream's clear is a second pass over every
+received byte (1.25 GB/s of memset at 10G).
+---
+ pkg/buffer/chunk.go | 40 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/buffer/chunk.go b/pkg/buffer/chunk.go
+index a58eed0..1aa5d5f 100644
+--- a/pkg/buffer/chunk.go
++++ b/pkg/buffer/chunk.go
+@@ -16,6 +16,7 @@ package buffer
+ 
+ import (
+ 	"fmt"
++	stdsync "sync"
+ 
+ 	"gvisor.dev/gvisor/pkg/bits"
+ 	"gvisor.dev/gvisor/pkg/sync"
+@@ -76,8 +77,34 @@ func getChunkPool(size int) *sync.Pool {
+ type chunk struct {
+ 	chunkRefs
+ 	data []byte
++	// external marks memory the caller owns (see NewViewFromExternal): the
++	// chunk is never written through a View and never pooled; release, if
++	// set, is called once when the last reference goes.
++	external bool
++	release  func()
+ }
+ 
++// externalChunks pools the chunk structs (not the memory) of external views,
++// which come and go once per segment on a transmit path.
++var externalChunks = stdsync.Pool{New: func() any { return &chunk{} }}
++
++// newExternalChunk wraps caller-owned memory.
++func newExternalChunk(data []byte, release func()) *chunk {
++	c := externalChunks.Get().(*chunk)
++	c.data, c.release, c.external = data, release, true
++	c.InitRefs()
++	return c
++}
++
++// ZeroOnReuse makes newChunk clear a pooled chunk before handing it out
++// again. Every user of a fresh view writes the bytes it exposes before
++// anything reads them (a received frame is copied in, headers are encoded
++// field by field, GrowTo zeroes explicitly when asked to), so the clear is a
++// second pass over every buffer for nothing — at 10 Gbit/s of receive it is
++// 1.25 GB/s of memset. Off by default in this fork; set it for a stack that
++// wants the old belt and braces.
++var ZeroOnReuse = false
++
+ func newChunk(size int) *chunk {
+ 	var c *chunk
+ 	if size > MaxChunkSize {
+@@ -87,13 +114,24 @@ func newChunk(size int) *chunk {
+ 	} else {
+ 		pool := getChunkPool(size)
+ 		c = pool.Get().(*chunk)
+-		clear(c.data)
++		if ZeroOnReuse {
++			clear(c.data)
++		}
+ 	}
+ 	c.InitRefs()
+ 	return c
+ }
+ 
+ func (c *chunk) destroy() {
++	if c.external {
++		r := c.release
++		c.release, c.data, c.external = nil, nil, false
++		if r != nil {
++			r()
++		}
++		externalChunks.Put(c)
++		return
++	}
+ 	if len(c.data) > MaxChunkSize {
+ 		c.data = nil
+ 		return
+-- 
+2.43.0
+

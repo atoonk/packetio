@@ -1,0 +1,31 @@
+From 32d58dd71391fd66f042901ebe58916e267ef8dc Mon Sep 17 00:00:00 2001
+From: Andree Toonk <andree@toonk.io>
+Date: Mon, 7 Sep 2026 01:55:14 +0000
+Subject: [PATCH 11/13] arp: send a request with the target link address zeroed
+
+The field is never written, so with buffer.ZeroOnReuse off it carries
+whatever the recycled chunk last held onto the wire.
+---
+ pkg/tcpip/network/arp/arp.go | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/pkg/tcpip/network/arp/arp.go b/pkg/tcpip/network/arp/arp.go
+index f416fe8..1744812 100644
+--- a/pkg/tcpip/network/arp/arp.go
++++ b/pkg/tcpip/network/arp/arp.go
+@@ -343,6 +343,12 @@ func (e *endpoint) sendARPRequest(localAddr, targetAddr tcpip.Address, remoteLin
+ 	pkt.NetworkProtocolNumber = ProtocolNumber
+ 	h.SetIPv4OverEthernet()
+ 	h.SetOp(header.ARPRequest)
++	// The target's link address is what the request asks for: it is sent as
++	// zero. Clearing it rather than leaving it is what makes that true, since
++	// the packet buffer's header room is not necessarily zeroed (see
++	// buffer.ZeroOnReuse); an unwritten field would put recycled bytes on the
++	// wire.
++	clear(h.HardwareAddressTarget())
+ 	// TODO(gvisor.dev/issue/4582): check copied length once TAP devices have a
+ 	// link address.
+ 	_ = copy(h.HardwareAddressSender(), e.nic.LinkAddress())
+-- 
+2.43.0
+
