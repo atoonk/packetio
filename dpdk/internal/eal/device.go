@@ -1,4 +1,4 @@
-//go:build linux && cgo && dpdk && amd64
+//go:build linux && cgo && dpdk && (amd64 || arm64)
 
 package eal
 
@@ -325,6 +325,65 @@ func PortStats(p Port) (Stats, error) {
 		Missed: uint64(st.imissed), InErrors: uint64(st.ierrors),
 		OutErrors: uint64(st.oerrors), NoBuffer: uint64(st.rx_nombuf),
 	}, nil
+}
+
+// XStat is one of the driver's own named counters.
+type XStat struct {
+	Name  string
+	Value uint64
+}
+
+// PortXStats reads every named counter the driver publishes, in the order the
+// driver lists them.
+//
+// This is where a NIC says what the eight numbers in Stats cannot. On EC2 it
+// is the only way to reach ENA's shaping counters -- pps_allowance_exceeded,
+// bw_in_allowance_exceeded and the rest -- from a process that owns the
+// device, because the kernel driver that would otherwise answer ethtool -S is
+// not attached to it. A port with nothing to add returns no stats and no
+// error; the set is the driver's business, and reading it is not free enough
+// to belong on the packet path.
+func PortXStats(p Port) ([]XStat, error) {
+	var (
+		errbuf [errLen]C.char
+		n      C.int
+	)
+	onEAL(func() { n = C.pio_xstats_count(C.uint16_t(p), &errbuf[0], errLen) })
+	if n < 0 {
+		return nil, cerr(&errbuf[0], "port %d", p)
+	}
+	if n == 0 {
+		return nil, nil
+	}
+
+	names := make([]C.char, int(n)*C.PIO_XSTAT_NAME_LEN)
+	values := make([]C.uint64_t, int(n))
+	var got C.int
+	onEAL(func() {
+		got = C.pio_xstats(C.uint16_t(p), &names[0], &values[0], n, &errbuf[0], errLen)
+	})
+	if got < 0 {
+		return nil, cerr(&errbuf[0], "port %d", p)
+	}
+
+	out := make([]XStat, 0, int(got))
+	for i := 0; i < int(got); i++ {
+		row := names[i*C.PIO_XSTAT_NAME_LEN : (i+1)*C.PIO_XSTAT_NAME_LEN]
+		out = append(out, XStat{Name: gostr(row), Value: uint64(values[i])})
+	}
+	return out, nil
+}
+
+// gostr reads the NUL-terminated name out of one fixed-width row.
+func gostr(row []C.char) string {
+	b := make([]byte, 0, len(row))
+	for _, c := range row {
+		if c == 0 {
+			break
+		}
+		b = append(b, byte(c))
+	}
+	return string(b)
 }
 
 // ------------------------------------------------------------------ memory

@@ -31,9 +31,13 @@ import (
 // does the cgo layer, because everything below indexes from it.
 const Size = 128
 
-// Field offsets inside an rte_mbuf, from DPDK 23.11 on linux/amd64 with
-// RTE_IOVA_IN_MBUF=1. Read out of the headers with offsetof on 28 August 2026
-// and checked by the layout test wherever DPDK is installed.
+// Field offsets inside an rte_mbuf, from DPDK 23.11 with RTE_IOVA_IN_MBUF=1.
+// Read out of the headers with offsetof on 28 August 2026 and checked by the
+// layout test wherever DPDK is installed -- which is what makes them safe to
+// state once for every architecture this backend builds for rather than per
+// arch: rte_mbuf is two cache lines of fixed-width fields and the layout is
+// the same on amd64 and arm64, but the test is the reason to believe that on
+// any given machine, not this comment.
 //
 // They are unexported because nothing outside this package should index an
 // mbuf by hand; Offsets reports them for the test and for a bug report.

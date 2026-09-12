@@ -1,4 +1,4 @@
-//go:build linux && cgo && dpdk && amd64
+//go:build linux && cgo && dpdk && (amd64 || arm64)
 
 package eal
 
@@ -15,10 +15,18 @@ package eal
 // wrong field.
 
 /*
-#cgo CFLAGS: -I/usr/include/dpdk -I/usr/include/x86_64-linux-gnu/dpdk -Wall
+#cgo CFLAGS: -I/usr/include/dpdk -Wall
+#cgo amd64 CFLAGS: -I/usr/include/x86_64-linux-gnu/dpdk
+#cgo arm64 CFLAGS: -I/usr/include/aarch64-linux-gnu/dpdk
 #include <string.h>
 #include <stddef.h>
 #include <rte_mbuf.h>
+#include <rte_mempool.h>
+
+// The mempool object header, which is cache-line aligned and so differs
+// between x86-64 (64) and aarch64 (128).
+static int pio_mempool_obj_header(void)
+{ return (int)RTE_ALIGN_CEIL(sizeof(struct rte_mempool_objhdr), RTE_MEMPOOL_ALIGN); }
 
 // offsetof, rather than cgo field access: several of these live inside
 // anonymous unions, which cgo does not expose as fields.
@@ -55,6 +63,11 @@ type HeaderLayout struct {
 	MbufSize int
 	Headroom int
 
+	// ObjHeader is what the mempool library puts in front of every object:
+	// sizeof(struct rte_mempool_objhdr) rounded up to RTE_MEMPOOL_ALIGN,
+	// which is the cache line size. 64 on x86-64, 128 on aarch64.
+	ObjHeader int
+
 	// Offsets maps the field names internal/mbuf uses to their offsets here.
 	Offsets map[string]int
 
@@ -69,8 +82,9 @@ type HeaderLayout struct {
 // Headers reads the mbuf layout out of the DPDK headers this build used.
 func Headers() HeaderLayout {
 	return HeaderLayout{
-		MbufSize: C.sizeof_struct_rte_mbuf,
-		Headroom: C.RTE_PKTMBUF_HEADROOM,
+		MbufSize:  C.sizeof_struct_rte_mbuf,
+		Headroom:  C.RTE_PKTMBUF_HEADROOM,
+		ObjHeader: int(C.pio_mempool_obj_header()),
 		Offsets: map[string]int{
 			"buf_addr":   int(C.pio_off_buf_addr()),
 			"buf_iova":   int(C.pio_off_buf_iova()),

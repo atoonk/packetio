@@ -17,7 +17,10 @@ On why this backend exists and how it measures against the other three:
 
 ## What you need
 
-- **x86-64.** The cgo layer is built for it; the build tag says `amd64`.
+- **amd64 or arm64.** The build tag says `(amd64 || arm64)`. The cgo layer
+  reads the mbuf layout out of the headers on the machine doing the build and
+  a test checks every offset, so a layout that differs is a failing test rather
+  than a packet path writing into the wrong field.
 - **DPDK 23.11 or later.** To build: `apt install libdpdk-dev` on Ubuntu 24.04.
   To *run* a binary built elsewhere: `apt install dpdk`, which is where the
   `librte_*` libraries live. The poll-mode drivers are plugins loaded at

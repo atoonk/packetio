@@ -1,44 +1,5 @@
-//go:build linux && cgo && dpdk && amd64
+//go:build linux && cgo && dpdk && (amd64 || arm64)
 
-// Package dpdk moves Ethernet frames through any NIC DPDK has a driver for.
-//
-// It is the portable fast backend. Where [github.com/atoonk/packetio/mlx5]
-// needs a ConnectX and AF_XDP needs the kernel in the path, this needs only a
-// poll-mode driver -- Intel, Broadcom, virtio, and the same ConnectX -- at the
-// cost of a build that links against DPDK and a machine set up for it.
-//
-// # What it costs
-//
-// The packet path crosses into C three times a batch: one burst each way, plus
-// a poke when a transmit queue has gone idle. A crossing measures about 36
-// nanoseconds on the hardware here, so at a batch of 64 it is under a
-// nanosecond a packet. Nothing is per packet.
-//
-// # What is different from the other backends
-//
-//   - A frame is not all packet. DPDK describes every buffer with an rte_mbuf,
-//     and here the mbufs live inside the frame region: each frame holds the
-//     mempool's object header, the mbuf, the headroom and then the packet, 320
-//     bytes in. Capabilities reports what is left as MaxFrameSize, and a
-//     descriptor reaching back past the headroom -- into the object header or
-//     the mbuf, the first 192 bytes -- is refused.
-//
-//   - Frames come back late. A driver reads its transmit completions inside a
-//     burst and nowhere else, and not until enough packets have gone since the
-//     last time -- 32 on mlx5. So a queue that stops sending mid-batch keeps
-//     those frames until it sends more. Complete and Reclaim poke the driver
-//     when the queue is otherwise idle, which is as much as DPDK allows.
-//
-//   - Who owns the device decides what steering means. See [WithSteering] and
-//     [Info.Coexists].
-//
-// # What it needs
-//
-// A build with the dpdk tag and libdpdk installed; hugepages, unless the device
-// is a virtual one opened with [WithoutHugePages]; and for a device this
-// process owns outright, that device bound to vfio-pci and an IOMMU. A device
-// still bound to a kernel driver is refused with the command that would rebind
-// it -- this library never rebinds anything itself.
 package dpdk
 
 import (
@@ -443,9 +404,12 @@ func Open(name string, opts ...Option) (d *Device, err error) {
 	return d, nil
 }
 
-// mempoolHeader is what the mempool library puts in front of every object. It
-// is checked against what was actually built rather than trusted.
-const mempoolHeader = 64
+// mempoolHeader is what the mempool library puts in front of every object.
+//
+// Read from the installed DPDK headers rather than hardcoded, because it is
+// cache-line aligned: 64 on x86-64 and 128 on aarch64. It is still checked
+// against the mempool actually built rather than trusted.
+var mempoolHeader = eal.Headers().ObjHeader
 
 // linkWait is how long Open waits for carrier. 10GBASE-T autonegotiation is
 // the slow case and takes a few seconds; a device whose link never comes up is
@@ -626,6 +590,35 @@ func (d *Device) Region() packetio.Region { return &region{d: d} }
 // PortStats are the device's own counters, which are the ones to believe about
 // what reached the wire.
 func (d *Device) PortStats() (eal.Stats, error) { return eal.PortStats(d.port) }
+
+// PortXStats are the driver's own named counters, in the order it lists them.
+//
+// What is in the set is entirely the driver's business: most PMDs publish
+// per-queue totals, and some publish things no generic counter could carry. On
+// EC2 this is the only way to read ENA's shaping counters --
+// pps_allowance_exceeded, bw_in_allowance_exceeded, conntrack_allowance_exceeded
+// and the rest -- from a process that owns the device, since the kernel driver
+// that answers ethtool -S is not attached to it. A driver with nothing to add
+// returns no stats and no error.
+//
+// It reads the whole set every call and allocates to do it, so it belongs
+// beside PortStats in a monitoring goroutine, not on the packet path.
+func (d *Device) PortXStats() ([]eal.XStat, error) { return eal.PortXStats(d.port) }
+
+// PortXStatsMap is PortXStats keyed by name, for a caller that wants to look a
+// counter up rather than walk the set. A driver that publishes the same name
+// twice keeps its last value, which no driver does.
+func (d *Device) PortXStatsMap() (map[string]uint64, error) {
+	xs, err := d.PortXStats()
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string]uint64, len(xs))
+	for _, x := range xs {
+		m[x.Name] = x.Value
+	}
+	return m, nil
+}
 
 // Close shuts down every queue and releases the device.
 //

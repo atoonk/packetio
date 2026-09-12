@@ -203,4 +203,19 @@ struct pio_stats {
 };
 int  pio_stats(uint16_t port, struct pio_stats *out, char *err, size_t errlen);
 
+/* The driver's own named counters -- rte_eth_xstats, which is where a NIC
+ * publishes what the eight numbers above cannot say. On EC2's ENA these are
+ * the only way to see bw_in_allowance_exceeded, pps_allowance_exceeded and the
+ * rest of the shaping counters, because the kernel driver that would otherwise
+ * answer ethtool -S is not attached to a device DPDK owns.
+ *
+ * pio_xstats_count reports how many there are. pio_xstats then fills names,
+ * which is n fixed-width entries of PIO_XSTAT_NAME_LEN bytes laid end to end,
+ * and values, which is n counters; both are the caller's to allocate. It
+ * returns how many entries it wrote, which is never more than n. */
+#define PIO_XSTAT_NAME_LEN 64
+int  pio_xstats_count(uint16_t port, char *err, size_t errlen);
+int  pio_xstats(uint16_t port, char *names, uint64_t *values, int n,
+		char *err, size_t errlen);
+
 #endif /* PACKETIO_DPDK_SHIM_H */

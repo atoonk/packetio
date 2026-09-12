@@ -1,12 +1,19 @@
 #include "shim.h"
 
-/* DPDK's headers inline SSSE3 and RTM intrinsics -- rte_memcpy uses
+/* On x86 DPDK's headers inline SSSE3 and RTM intrinsics -- rte_memcpy uses
  * _mm_alignr_epi8, rte_rtm uses _xbegin -- and pkg-config asks for
  * "-march=corei7 -mrtm" to compile them. cgo refuses to pass -m flags through,
  * so the target is set here, on the one translation unit that includes DPDK.
  * Without it the build fails on "inlining failed in call to always_inline
- * _mm_alignr_epi8: target specific option mismatch". */
+ * _mm_alignr_epi8: target specific option mismatch".
+ *
+ * aarch64 needs none of this: the NEON that DPDK's arm64 rte_memcpy uses is in
+ * the baseline architecture, and there is no transactional-memory header to
+ * satisfy. The pragma names x86 features, so it has to be kept away from a
+ * compiler that has never heard of them. */
+#ifdef __x86_64__
 #pragma GCC target("ssse3,sse4.2,rtm")
+#endif
 
 #include <rte_config.h>
 #include <rte_eal.h>
@@ -34,9 +41,18 @@ _Static_assert(sizeof(struct rte_mbuf) == 128, "rte_mbuf is not 128 bytes");
 _Static_assert(RTE_IOVA_IN_MBUF == 1, "buf_iova is not in the mbuf");
 _Static_assert(RTE_PKTMBUF_HEADROOM == 128, "the headroom is not 128 bytes");
 
-/* What the mempool library puts in front of every object. It is checked
- * against the mempool actually built rather than assumed. */
-#define PIO_OBJ_HEADER 64
+/* What the mempool library puts in front of every object.
+ *
+ * NOT a fixed 64. The mempool aligns each object header up to
+ * RTE_MEMPOOL_ALIGN, which is RTE_CACHE_LINE_SIZE -- 64 on x86-64 but *128 on
+ * aarch64*, because Graviton has 128-byte cache lines. Hardcoding 64 makes
+ * elt_size 64 bytes too large on arm64, the library pads the object out to the
+ * next alignment boundary, and objects stop being exactly one frame apart.
+ * Measured on a c8gn.large: header 128, trailer 64, and Open refused.
+ *
+ * It is still checked against the mempool actually built rather than trusted. */
+#define PIO_OBJ_HEADER \
+	((int)RTE_ALIGN_CEIL(sizeof(struct rte_mempool_objhdr), RTE_MEMPOOL_ALIGN))
 
 static int failf(char *err, size_t errlen, const char *fmt, ...)
 {
@@ -820,4 +836,66 @@ int pio_stats(uint16_t port, struct pio_stats *out, char *err, size_t errlen)
 	out->oerrors = st.oerrors;
 	out->rx_nombuf = st.rx_nombuf;
 	return 0;
+}
+
+/* The name buffer is handed across as fixed-width rows so that Go can slice it
+ * without a second pass; DPDK's own name struct has to agree about the width. */
+_Static_assert(RTE_ETH_XSTATS_NAME_SIZE == PIO_XSTAT_NAME_LEN,
+	       "rte_eth_xstat_name is not PIO_XSTAT_NAME_LEN bytes");
+
+int pio_xstats_count(uint16_t port, char *err, size_t errlen)
+{
+	int n = rte_eth_xstats_get_names(port, NULL, 0);
+
+	if (n < 0)
+		return failf(err, errlen, "counting the named counters of port %u", port);
+	return n;
+}
+
+int pio_xstats(uint16_t port, char *names, uint64_t *values, int n,
+	       char *err, size_t errlen)
+{
+	struct rte_eth_xstat_name *xn = NULL;
+	struct rte_eth_xstat *xv = NULL;
+	int named, valued, i, rc = -1;
+
+	if (n <= 0)
+		return 0;
+	xn = rte_zmalloc(NULL, (size_t)n * sizeof(*xn), 0);
+	xv = rte_zmalloc(NULL, (size_t)n * sizeof(*xv), 0);
+	if (!xn || !xv) {
+		failf(err, errlen, "allocating room for %d named counters", n);
+		goto out;
+	}
+
+	named = rte_eth_xstats_get_names(port, xn, (unsigned)n);
+	if (named < 0) {
+		failf(err, errlen, "reading the counter names of port %u", port);
+		goto out;
+	}
+	if (named > n)
+		named = n;
+	valued = rte_eth_xstats_get(port, xv, (unsigned)n);
+	if (valued < 0) {
+		failf(err, errlen, "reading the named counters of port %u", port);
+		goto out;
+	}
+	if (valued > n)
+		valued = n;
+
+	/* A value carries the index of its own name rather than matching by
+	 * position, and the driver is free to leave gaps, so the names go out
+	 * in full and the values are placed by the id each one came with. */
+	memset(values, 0, (size_t)named * sizeof(*values));
+	for (i = 0; i < named; i++)
+		memcpy(names + (size_t)i * PIO_XSTAT_NAME_LEN, xn[i].name,
+		       PIO_XSTAT_NAME_LEN);
+	for (i = 0; i < valued; i++)
+		if (xv[i].id < (uint64_t)named)
+			values[xv[i].id] = xv[i].value;
+	rc = named;
+out:
+	rte_free(xn);
+	rte_free(xv);
+	return rc;
 }

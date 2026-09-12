@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+**dpdk: arm64.** The backend builds on aarch64 as well as x86-64 -- the tag is
+now `(amd64 || arm64)`, the cgo include path picks the right multiarch
+directory, and the `#pragma GCC target` that satisfies x86's SSSE3 and RTM
+intrinsics is kept away from a compiler that has never heard of them. Nothing
+about the mbuf layout is assumed per architecture: the layout test reads every
+offset back out of the installed headers with `offsetof`, so a machine whose
+DPDK differs fails a test instead of corrupting frames. This is what makes
+Graviton measurable with the same tool as everything else.
+
+**dpdk: the driver's own named counters.** `Device.PortXStats` returns
+`rte_eth_xstats` -- the counters a PMD publishes beyond the eight generic ones,
+including per-queue totals. On EC2 this is the only way to read ENA's shaping
+counters (`pps_allowance_exceeded`, `bw_in_allowance_exceeded`,
+`conntrack_allowance_exceeded`) from a process that owns the device, because
+the kernel driver that answers `ethtool -S` is not attached to it. Values are
+placed by the id each one arrives with rather than by position, which is what
+`rte_eth_xstats_get` actually promises, and a test transmits frames and checks
+the named counter against the generic one to prove it.
+
 ## v0.1.7
 
 **netstack: gVisor's TCP/IP stack over every backend.** A new module,

@@ -1,8 +1,9 @@
-//go:build linux && cgo && dpdk && amd64
+//go:build linux && cgo && dpdk && (amd64 || arm64)
 
 package eal
 
 import (
+	"runtime"
 	"testing"
 
 	"github.com/atoonk/packetio/dpdk/internal/mbuf"
@@ -89,3 +90,32 @@ func TestTxOffloadPackingMatchesTheBitfield(t *testing.T) {
 		}
 	}
 }
+
+// The mempool object header is cache-line aligned, so it is 64 bytes on x86-64
+// and 128 on aarch64. It was hardcoded to 64 once, which built and tested
+// perfectly on x86 and then refused to open a device on Graviton with
+// "this DPDK puts 128 bytes in front of a mempool object and 64 behind it".
+// Anything that derives a frame address from it has to take it from here.
+func TestMempoolObjectHeaderIsCacheLineAligned(t *testing.T) {
+	h := Headers().ObjHeader
+	switch runtime.GOARCH {
+	case "amd64":
+		if h != 64 {
+			t.Errorf("object header is %d on amd64, want 64", h)
+		}
+	case "arm64":
+		if h != 128 {
+			t.Errorf("object header is %d on arm64, want 128", h)
+		}
+	}
+	if h <= 0 || h&(h-1) != 0 {
+		t.Errorf("object header %d is not a power of two", h)
+	}
+	if h < mbufObjHdrMin {
+		t.Errorf("object header %d is too small to hold an rte_mempool_objhdr", h)
+	}
+}
+
+// An objhdr is a list entry plus a pool pointer plus a cookie: 24 bytes on any
+// 64-bit target, and the aligned-up header can never be smaller than that.
+const mbufObjHdrMin = 24

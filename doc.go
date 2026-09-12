@@ -20,8 +20,8 @@
 //	dpdk     Any NIC DPDK has a poll-mode driver for -- Intel, Broadcom,
 //	         virtio, and the ConnectX too. A custom mempool keeps packetio's
 //	         frame-ownership model intact under the driver; the packet path
-//	         is one cgo crossing per burst, never one per packet. x86-64
-//	         only, behind the dpdk build tag.
+//	         is one cgo crossing per burst, never one per packet. amd64 and
+//	         arm64, behind the dpdk build tag.
 //	afpacket Linux AF_PACKET: a TPACKET_V3 mmap ring on receive and batched
 //	         sendmmsg on transmit. Needs no hardware support and no cgo, and
 //	         is far slower than the others. It is the fallback that works

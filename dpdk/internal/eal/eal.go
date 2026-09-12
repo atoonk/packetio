@@ -1,4 +1,4 @@
-//go:build linux && cgo && dpdk && amd64
+//go:build linux && cgo && dpdk && (amd64 || arm64)
 
 // Package eal is the only part of the DPDK backend that talks to DPDK.
 //
@@ -24,7 +24,9 @@
 package eal
 
 /*
-#cgo CFLAGS: -I/usr/include/dpdk -I/usr/include/x86_64-linux-gnu/dpdk -Wall
+#cgo CFLAGS: -I/usr/include/dpdk -Wall
+#cgo amd64 CFLAGS: -I/usr/include/x86_64-linux-gnu/dpdk
+#cgo arm64 CFLAGS: -I/usr/include/aarch64-linux-gnu/dpdk
 #cgo LDFLAGS: -lrte_eal -lrte_log -lrte_ethdev -lrte_mempool -lrte_mbuf -lrte_net -lrte_bus_pci -lrte_bus_vdev -lrte_kvargs -lrte_telemetry -lrte_ring -lrte_hash -lrte_pci
 #include <stdlib.h>
 #include "shim.h"

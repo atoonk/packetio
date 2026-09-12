@@ -562,7 +562,7 @@ hardware at all.
 
 ## Requirements
 
-Linux, amd64 or arm64 (the dpdk backend is amd64 only). `CAP_NET_RAW`
+Linux, amd64 or arm64. `CAP_NET_RAW`
 everywhere. mlx5 additionally needs rdma-core and a memory lock limit large
 enough for the frame region; dpdk needs libdpdk and, on most cards, hugepages
 and an IOMMU.
