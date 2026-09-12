@@ -1,4 +1,4 @@
-//go:build linux && cgo && dpdk && amd64
+//go:build linux && cgo && dpdk && (amd64 || arm64)
 
 package dpdk_test
 
@@ -459,9 +459,17 @@ func TestInfoIsTruthful(t *testing.T) {
 		t.Error("the device does not say what it is taking")
 	}
 	// A virtual device has no kernel interface behind it, so it cannot claim
-	// to be sharing one.
-	if strings.HasPrefix(i.Device, "net_") && i.Coexists {
+	// to be sharing one -- except for the two that are defined by sitting on
+	// one. net_af_packet opens a socket on an existing interface and net_tap
+	// creates one, and both leave it in the kernel's hands; those are the
+	// devices Coexists exists to describe.
+	onKernelIface := strings.Contains(i.Device, "net_af_packet") ||
+		strings.Contains(i.Device, "net_tap")
+	if strings.HasPrefix(i.Device, "net_") && i.Coexists && !onKernelIface {
 		t.Errorf("%s claims the kernel still has an interface for it", i.Device)
+	}
+	if onKernelIface && !i.Coexists {
+		t.Errorf("%s sits on a kernel interface but says it does not coexist", i.Device)
 	}
 
 	c := d.Capabilities()
