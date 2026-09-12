@@ -1,4 +1,4 @@
-//go:build linux && cgo && dpdk && amd64
+//go:build linux && cgo && dpdk && (amd64 || arm64)
 
 package main
 
@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/atoonk/packetio"
+	"github.com/atoonk/packetio/dpdk"
 	"github.com/atoonk/packetio/examples/internal/metrics"
 )
 
@@ -89,6 +90,10 @@ func reportLoop(ctx context.Context, dev packetio.Device, c config, good []count
 
 	begin := time.Now()
 	prevCPU, prevSW, prevNIC, prevAt := cpuStart, swStart, nicStart, begin
+	startAllow := readAllowances(dev)
+	prevAllow := startAllow
+	startPort := readPort(dev)
+	prevPort := startPort
 
 	tick := time.NewTicker(c.report)
 	defer tick.Stop()
@@ -119,9 +124,17 @@ func reportLoop(ctx context.Context, dev packetio.Device, c config, good []count
 				nicOK = false
 			}
 		}
+		curPort := readPort(dev)
 		fmt.Println(format(elapsed, sw.sub(prevSW), metrics.Delta(prevCPU, cpu),
-			nic.Sub(prevNIC), nicOK, hz))
-		prevSW, prevCPU, prevNIC = sw, cpu, nic
+			nic.Sub(prevNIC), nicOK, hz, curPort.sub(prevPort)))
+		prevPort = curPort
+		allow := readAllowances(dev)
+		if allow.WentBackwards(prevAllow) {
+			fmt.Println("  INVALID: an allowance counter reset mid-run")
+		} else if line := allow.Sub(prevAllow).String(); line != "" {
+			fmt.Println("  " + line)
+		}
+		prevSW, prevCPU, prevNIC, prevAllow = sw, cpu, nic, allow
 	}
 
 	elapsed := time.Since(begin)
@@ -141,7 +154,10 @@ func reportLoop(ctx context.Context, dev packetio.Device, c config, good []count
 	}
 	fmt.Println()
 	fmt.Println("total: " + format(elapsed, sw.sub(swStart), metrics.Delta(cpuStart, cpu),
-		nic.Sub(nicStart), nicOK, hz))
+		nic.Sub(nicStart), nicOK, hz, readPort(dev).sub(startPort)))
+	if line := readAllowances(dev).Sub(startAllow).String(); line != "" {
+		fmt.Println("  over the whole run: " + line)
+	}
 	if sw.batches > 0 {
 		// Packets per receive call: the number that says whether the loop is
 		// taking packets in useful sizes. A backend once lost half its
@@ -165,7 +181,7 @@ func reportLoop(ctx context.Context, dev packetio.Device, c config, good []count
 }
 
 func format(elapsed time.Duration, sw totals, cpu metrics.CPUSample,
-	nic metrics.NICCounters, nicOK bool, hz float64) string {
+	nic metrics.NICCounters, nicOK bool, hz float64, port portCounters) string {
 	s := elapsed.Seconds()
 	if s <= 0 {
 		return ""
@@ -181,6 +197,19 @@ func format(elapsed time.Duration, sw totals, cpu metrics.CPUSample,
 		if missed := nic.RxDiscards + nic.RxOutOfBuffer; missed > 0 {
 			out += fmt.Sprintf("  missed %d", missed)
 		}
+	} else if port.ok {
+		// The same question, asked of the device rather than of the kernel.
+		// A device this process owns has no kernel interface to read, which is
+		// exactly the case where "did we drop these, or did the fabric?" is
+		// hardest to answer and matters most: missed is the receiver failing to
+		// keep up, and it is a different fact from an allowance being exceeded.
+		out += fmt.Sprintf("   port %6.2f Mpps", float64(port.rx)/s/1e6)
+		if port.missed > 0 {
+			out += fmt.Sprintf("  missed %d", port.missed)
+		}
+		if port.noBuf > 0 {
+			out += fmt.Sprintf("  nobuf %d", port.noBuf)
+		}
 	}
 	out += fmt.Sprintf("   %5.2f cores", cpu.Cores())
 	if hz > 0 && sw.packets > 0 {
@@ -190,3 +219,48 @@ func format(elapsed time.Duration, sw totals, cpu metrics.CPUSample,
 }
 
 const frameOverhead = 4 + 8 + 12
+
+// readAllowances reads EC2's network allowance counters off the device itself.
+//
+// On a DPDK-owned ENI this is the only way to reach them: the kernel driver
+// that answers ethtool -S is not attached to the device, so the -counters
+// interface cannot see them. Anywhere else the driver publishes no such
+// counters, this comes back empty, and nothing is printed.
+func readAllowances(dev packetio.Device) metrics.ENAAllowances {
+	d, ok := dev.(*dpdk.Device)
+	if !ok {
+		return metrics.ENAAllowances{}
+	}
+	m, err := d.PortXStatsMap()
+	if err != nil {
+		return metrics.ENAAllowances{}
+	}
+	return metrics.Allowances(m)
+}
+
+// portCounters is what the device itself says it received and could not place.
+// Read from the port rather than from a kernel interface, because a device
+// bound to a userspace driver has no kernel interface to ask.
+type portCounters struct {
+	rx, missed, noBuf uint64
+	ok                bool
+}
+
+func readPort(dev packetio.Device) portCounters {
+	d, ok := dev.(*dpdk.Device)
+	if !ok {
+		return portCounters{}
+	}
+	st, err := d.PortStats()
+	if err != nil {
+		return portCounters{}
+	}
+	return portCounters{rx: st.InPackets, missed: st.Missed, noBuf: st.NoBuffer, ok: true}
+}
+
+func (p portCounters) sub(o portCounters) portCounters {
+	if !p.ok || !o.ok {
+		return portCounters{}
+	}
+	return portCounters{rx: p.rx - o.rx, missed: p.missed - o.missed, noBuf: p.noBuf - o.noBuf, ok: true}
+}

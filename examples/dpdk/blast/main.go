@@ -1,4 +1,4 @@
-//go:build linux && cgo && dpdk && amd64
+//go:build linux && cgo && dpdk && (amd64 || arm64)
 
 // Command blast transmits UDP frames as fast as it can through DPDK, and says
 // what that cost.

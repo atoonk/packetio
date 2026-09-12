@@ -1,4 +1,4 @@
-//go:build linux && cgo && dpdk && amd64
+//go:build linux && cgo && dpdk && (amd64 || arm64)
 
 package main
 
@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/atoonk/packetio"
+	"github.com/atoonk/packetio/dpdk"
 	"github.com/atoonk/packetio/examples/internal/metrics"
 )
 
@@ -90,6 +91,8 @@ func reportLoop(ctx context.Context, dev packetio.Device, c config) error {
 
 	begin := time.Now()
 	prevCPU, prevSW, prevNIC, prevAt := cpuStart, swStart, nicStart, begin
+	startAllow := readAllowances(dev)
+	prevAllow := startAllow
 
 	tick := time.NewTicker(c.report)
 	defer tick.Stop()
@@ -122,7 +125,13 @@ func reportLoop(ctx context.Context, dev packetio.Device, c config) error {
 		}
 		fmt.Println(format(elapsed, sw.sub(prevSW), metrics.Delta(prevCPU, cpu),
 			nic.Sub(prevNIC), nicOK, hz, c))
-		prevSW, prevCPU, prevNIC = sw, cpu, nic
+		allow := readAllowances(dev)
+		if allow.WentBackwards(prevAllow) {
+			fmt.Println("  INVALID: an allowance counter reset mid-run")
+		} else if line := allow.Sub(prevAllow).String(); line != "" {
+			fmt.Println("  " + line)
+		}
+		prevSW, prevCPU, prevNIC, prevAllow = sw, cpu, nic, allow
 	}
 
 	elapsed := time.Since(begin)
@@ -143,6 +152,9 @@ func reportLoop(ctx context.Context, dev packetio.Device, c config) error {
 	fmt.Println()
 	fmt.Println("total: " + format(elapsed, sw.sub(swStart), metrics.Delta(cpuStart, cpu),
 		nic.Sub(nicStart), nicOK, hz, c))
+	if line := readAllowances(dev).Sub(startAllow).String(); line != "" {
+		fmt.Println("  over the whole run: " + line)
+	}
 	if sw.inFlight > 0 {
 		// Not a leak: a driver signals completions in its own time, and mlx5
 		// asks for one only every 32 packets.
@@ -185,3 +197,21 @@ func format(elapsed time.Duration, sw totals, cpu metrics.CPUSample,
 // frameOverhead is the check sequence, preamble and inter-frame gap the wire
 // carries beyond the bytes handed to the device.
 const frameOverhead = 4 + 8 + 12
+
+// readAllowances reads EC2's network allowance counters off the device itself.
+//
+// On a DPDK-owned ENI this is the only way to reach them: the kernel driver
+// that answers ethtool -S is not attached to the device, so the -counters
+// interface cannot see them. Anywhere else the driver publishes no such
+// counters, this comes back empty, and nothing is printed.
+func readAllowances(dev packetio.Device) metrics.ENAAllowances {
+	d, ok := dev.(*dpdk.Device)
+	if !ok {
+		return metrics.ENAAllowances{}
+	}
+	m, err := d.PortXStatsMap()
+	if err != nil {
+		return metrics.ENAAllowances{}
+	}
+	return metrics.Allowances(m)
+}

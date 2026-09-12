@@ -1,4 +1,4 @@
-//go:build linux && cgo && dpdk && amd64
+//go:build linux && cgo && dpdk && (amd64 || arm64)
 
 // Command l3fwd is an IPv4 router on one port, through DPDK: it takes the
 // packets steered to it, looks each destination up in a forwarding table,

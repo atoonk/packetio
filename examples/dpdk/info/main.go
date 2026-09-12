@@ -1,4 +1,4 @@
-//go:build linux && cgo && dpdk && amd64
+//go:build linux && cgo && dpdk && (amd64 || arm64)
 
 // Command info opens a device through DPDK and prints what it found: which
 // driver claimed it, whether the kernel still has it too, what the port will

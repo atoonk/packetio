@@ -1,4 +1,4 @@
-//go:build linux && cgo && dpdk && amd64
+//go:build linux && cgo && dpdk && (amd64 || arm64)
 
 // Command drop receives packets through DPDK and throws them away, reporting
 // what arrived and what it cost.
