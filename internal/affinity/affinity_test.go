@@ -3,6 +3,7 @@
 package affinity
 
 import (
+	"fmt"
 	"runtime"
 	"strings"
 	"testing"
@@ -250,4 +251,77 @@ func TestParseCPUListIsBounded(t *testing.T) {
 	if got := parseCPUList("0-99999999"); len(got) != 0 {
 		t.Errorf("accepted an out-of-range span: %d entries", len(got))
 	}
+}
+
+// Asking for more workers than there are physical cores must still place every
+// one of them, each on a processor of its own.
+//
+// This is the case that used to fail. The first tier is one processor per
+// physical core, so on anything with SMT a caller asking for one worker per
+// vCPU asks for twice what that tier holds -- and Pin used to give up, leaving
+// the surplus workers unplaced. Measured on a 4-vCPU EC2 instance (2 cores,
+// 2 threads each): exactly half the throughput, 2.01 cores busy of 4.00.
+// Nothing about that is specific to a cloud; a bare-metal box hits it as soon
+// as the queue count passes the core count.
+func TestPinFallsBackToSMTSiblings(t *testing.T) {
+	p, err := New("lo", nil)
+	if err != nil || p == nil {
+		t.Skip("no usable topology here")
+	}
+	phys := physicalCoreCount(t)
+	if phys == 0 || len(p.cpus) <= phys {
+		t.Skipf("no SMT here: %d processors offered for %d physical cores", len(p.cpus), phys)
+	}
+
+	// One worker per processor the plan offers, which is more than there are
+	// cores. Every one must be placed, and no two may land together.
+	n := len(p.cpus)
+	type result struct {
+		cpu int
+		err error
+	}
+	out := make(chan result, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			cpu, err := p.Pin()
+			out <- result{cpu, err}
+		}()
+	}
+	seen := map[int]bool{}
+	for i := 0; i < n; i++ {
+		r := <-out
+		if r.err != nil {
+			t.Fatalf("worker %d of %d was not placed, though %d physical cores and %d processors are available: %v",
+				i+1, n, phys, n, r.err)
+		}
+		if seen[r.cpu] {
+			t.Errorf("processor %d was handed out twice", r.cpu)
+		}
+		seen[r.cpu] = true
+	}
+
+	// The measured optimum has to survive: physical cores must come first, so
+	// a caller who asks for no more workers than cores is unaffected.
+	for i := 0; i < phys; i++ {
+		sibs := readCPUList(fmt.Sprintf("/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", p.cpus[i]))
+		if len(sibs) > 0 && sibs[0] != p.cpus[i] {
+			t.Errorf("position %d is processor %d, a sibling, before every core was used",
+				i, p.cpus[i])
+		}
+	}
+}
+
+// physicalCoreCount counts distinct physical cores among the online processors.
+func physicalCoreCount(t *testing.T) int {
+	t.Helper()
+	leads := map[int]bool{}
+	for _, c := range onlineCPUs() {
+		sibs := readCPUList(fmt.Sprintf("/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c))
+		if len(sibs) == 0 {
+			leads[c] = true
+			continue
+		}
+		leads[sibs[0]] = true
+	}
+	return len(leads)
 }

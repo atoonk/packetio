@@ -121,11 +121,14 @@ func packedCPUs(ifname string, allowed map[int]bool, haveAllowed bool) ([]int, s
 		lead  int   // lowest cpu of the complex, for ordering
 		node  int   // memory node it belongs to
 		cores []int // one processor per physical core
+		sibs  []int // the other SMT threads of those cores, as a fallback
 	}
 	var (
-		complexes []*complex
-		byLead    = map[int]*complex{}
-		seenCore  = map[int]bool{}
+		complexes   []*complex
+		byLead      = map[int]*complex{}
+		seenCore    = map[int]bool{}
+		leadComplex = map[int]int{} // physical core lead -> its complex key
+		strayS      []int
 	)
 	for _, c := range onlineCPUs() {
 		if haveAllowed && !allowed[c] {
@@ -138,7 +141,18 @@ func packedCPUs(ifname string, allowed map[int]bool, haveAllowed bool) ([]int, s
 		if len(sibs) > 0 {
 			lead = sibs[0]
 		}
-		if seenCore[lead] || lead != c {
+		if lead != c {
+			// The other half of a core already counted. Keep it aside: it is
+			// not a second core, but it is a second place to run, and running
+			// there beats not running at all.
+			if cx := byLead[leadComplex[lead]]; cx != nil {
+				cx.sibs = append(cx.sibs, c)
+			} else {
+				strayS = append(strayS, c)
+			}
+			continue
+		}
+		if seenCore[lead] {
 			continue
 		}
 		seenCore[lead] = true
@@ -155,6 +169,17 @@ func packedCPUs(ifname string, allowed map[int]bool, haveAllowed bool) ([]int, s
 			complexes = append(complexes, cx)
 		}
 		cx.cores = append(cx.cores, c)
+		leadComplex[lead] = key
+	}
+	// Siblings seen before their core's complex existed.
+	for _, c := range strayS {
+		sibs := readCPUList(fmt.Sprintf("/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c))
+		if len(sibs) == 0 {
+			continue
+		}
+		if cx := byLead[leadComplex[sibs[0]]]; cx != nil {
+			cx.sibs = append(cx.sibs, c)
+		}
 	}
 	if len(complexes) == 0 {
 		return nil, ""
@@ -173,12 +198,35 @@ func packedCPUs(ifname string, allowed map[int]bool, haveAllowed bool) ([]int, s
 		return a.lead < b.lead
 	})
 
+	// Physical cores first, in the measured order. Then, and only then, the
+	// SMT siblings.
+	//
+	// Running out of physical cores used to be a hard failure: Pin returned
+	// "no processor left to place a worker on" and the worker ran unplaced. On
+	// anything with SMT that is easy to hit -- a 4-vCPU EC2 instance is two
+	// cores, so one queue per vCPU asks for twice what the first tier holds,
+	// and the measured cost was exactly half the throughput (0.20 Mpps of
+	// 0.40, 2.01 cores of 4.00). A sibling is a worse place to run than a core
+	// of one's own, and a far better one than nowhere.
+	//
+	// This is not a rule about EC2, or about virtual machines, or about any
+	// architecture: it is what to do when a caller asks for more workers than
+	// there are cores, which a bare-metal box hits too as soon as the queue
+	// count passes its core count.
 	var out []int
 	for _, cx := range complexes {
 		sort.Ints(cx.cores)
 		out = append(out, cx.cores...)
 	}
-	note := fmt.Sprintf("%d cores over %d cache complexes", len(out), len(complexes))
+	phys := len(out)
+	for _, cx := range complexes {
+		sort.Ints(cx.sibs)
+		out = append(out, cx.sibs...)
+	}
+	note := fmt.Sprintf("%d cores over %d cache complexes", phys, len(complexes))
+	if len(out) > phys {
+		note += fmt.Sprintf(", then %d sibling threads", len(out)-phys)
+	}
 	if node >= 0 {
 		note += fmt.Sprintf(", card on memory node %d", node)
 	}
