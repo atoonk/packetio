@@ -1,16 +1,5 @@
 //go:build linux && cgo && mlx5 && (amd64 || arm64)
 
-// Package mlx5 moves Ethernet frames through an NVIDIA ConnectX or BlueField
-// NIC using mlx5 Direct Verbs.
-//
-// Opening a device asks libibverbs and libmlx5 for a raw Ethernet queue pair
-// and then asks where the memory they allocated for it lives. From that point
-// the packet path is Go over that memory: writing work queue entries, reading
-// completions, and one eight-byte write to a device register per batch. There
-// is no syscall, no library call and no cgo call per packet or per batch.
-//
-// A queue is owned by one goroutine. Two goroutines may drive two queues of the
-// same device; two goroutines may not drive one queue.
 package mlx5
 
 import (
