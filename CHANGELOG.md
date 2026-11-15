@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+**mlx5: IPv6 and TCP are spread across the receive queues.** The receive
+group had one hash, over the IPv4 addresses and the UDP ports. A packet with
+none of those fields got no hash and went to the first queue, so all IPv6
+arrived on one queue: 11.7 Mpps of 111 offered on a 16-queue ConnectX-6. There
+is now one hash per kind of packet (IPv4 UDP, IPv4 TCP, other IPv4, IPv6 UDP,
+IPv6 TCP, other IPv6) over the same indirection table, and what is not IP
+still goes where it went. Measured on that card with 4096 flows: IPv6 UDP 11.7
+to 107.7 Mpps of 111.4 offered, IPv4 UDP 122.8 before and after, IPv4 TCP
+121.5 and 121.1. A match that names IPv4 addresses, a protocol or ports is
+installed exactly as before. Not measured: IPv6 TCP at rate, tunnelled
+traffic, ConnectX-5. No test here covers it, because it needs a card.
+
+**dpdk: a receiver that waits with `Poll` no longer allocates per burst.**
+`Poll` has to take packets to learn that they are there, and keeps them for
+the next `Receive`. `Receive` then gave that array to the caller and started a
+new one, so every `Poll` that found a packet allocated. At 15.3 Mpps on a
+32-queue forwarder that was about 240 MB/s of garbage, a collection every few
+seconds and a burst of drops with each. The queue now keeps a second array
+for what `Receive` returns. The contract is unchanged: the slice belongs to
+the caller until the next `Receive`. Measured over 30 s on a 100G mlx5 pair:
+collections 3 to 0, packets dropped 56,474 to 2,366 and 571. A receiver that
+only busy-polls `Receive` never took this path.
+
 **dpdk: arm64.** The backend builds on aarch64 as well as x86-64 -- the tag is
 now `(amd64 || arm64)`, the cgo include path picks the right multiarch
 directory, and the `#pragma GCC target` that satisfies x86's SSSE3 and RTM
