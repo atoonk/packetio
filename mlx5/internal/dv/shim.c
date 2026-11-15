@@ -1,10 +1,21 @@
 #include "shim.h"
 
-/* Room for a header and the three specifications a rule may carry. */
+/* Room for a header and the three specifications a rule may carry. The IPv6
+ * specification is the larger of the two network layers. */
 #define PIO_FLOW_BUF (sizeof(struct ibv_flow_attr) + \
 		      sizeof(struct ibv_flow_spec_eth) + \
-		      sizeof(struct ibv_flow_spec_ipv4_ext) + \
+		      sizeof(struct ibv_flow_spec_ipv6) + \
 		      sizeof(struct ibv_flow_spec_tcp_udp))
+
+/* Where a rule sits among the others. The card tries the lower number first.
+ * A rule naming a transport is tried before one naming only an IP version,
+ * and both before the rule that takes whatever the match allows, so that each
+ * packet reaches the most specific hash there is for it. UDP and TCP of both
+ * versions share the first place, so the bulk of the traffic is decided by the
+ * first rule table the card looks in. */
+#define PIO_PRIO_L4  0
+#define PIO_PRIO_L3  1
+#define PIO_PRIO_ANY 2
 
 #include <errno.h>
 #include <stdio.h>
@@ -581,7 +592,126 @@ int pio_create_rx_group(pio_ctx *c, struct pio_rxq *qs, uint32_t n,
 		g->ind_table = NULL;
 		return rc;
 	}
+	g->kind[PIO_HASH_V4_UDP] = g->qp;
+
+	/* The same table again, once per other kind of packet. Without these
+	 * an IPv6 packet reaches the queue pair above, which hashes IPv4
+	 * fields, finds none, and puts every one of them on the first queue. */
+	for (i = PIO_HASH_V4_UDP + 1; i < PIO_NHASH; i++) {
+		static const uint64_t fields[PIO_NHASH] = {
+			[PIO_HASH_V4_TCP] = IBV_RX_HASH_SRC_IPV4 | IBV_RX_HASH_DST_IPV4 |
+					    IBV_RX_HASH_SRC_PORT_TCP | IBV_RX_HASH_DST_PORT_TCP,
+			[PIO_HASH_V4_IP]  = IBV_RX_HASH_SRC_IPV4 | IBV_RX_HASH_DST_IPV4,
+			[PIO_HASH_V6_UDP] = IBV_RX_HASH_SRC_IPV6 | IBV_RX_HASH_DST_IPV6 |
+					    IBV_RX_HASH_SRC_PORT_UDP | IBV_RX_HASH_DST_PORT_UDP,
+			[PIO_HASH_V6_TCP] = IBV_RX_HASH_SRC_IPV6 | IBV_RX_HASH_DST_IPV6 |
+					    IBV_RX_HASH_SRC_PORT_TCP | IBV_RX_HASH_DST_PORT_TCP,
+			[PIO_HASH_V6_IP]  = IBV_RX_HASH_SRC_IPV6 | IBV_RX_HASH_DST_IPV6,
+		};
+
+		qpia.rx_hash_conf.rx_hash_fields_mask = fields[i];
+		g->kind[i] = ibv_create_qp_ex(c->ctx, &qpia);
+		if (!g->kind[i]) {
+			rc = fail(err, errlen, "ibv_create_qp_ex for a receive hash");
+			pio_destroy_rx_group(g, NULL, 0);
+			return rc;
+		}
+	}
 	return 0;
+}
+
+/* pio_match_kinds reports which kinds of packet a match has to be divided
+ * into: the IPv4 ones, the IPv6 ones, or none because it already says more
+ * about the packet than a kind does. *rest is set when packets that are not IP
+ * can meet the match too. */
+static void pio_match_kinds(const struct pio_match *m, int *v4, int *v6, int *rest)
+{
+	*v4 = *v6 = *rest = 0;
+	if (m->src_mask || m->dst_mask || m->have_proto ||
+	    m->have_src_port || m->have_dst_port)
+		return;		/* an IPv4 match, installed as it is asked for */
+	if (!m->have_ether_type) {
+		*v4 = *v6 = *rest = 1;
+		return;
+	}
+	*v4 = m->ether_type == 0x0800;
+	*v6 = m->ether_type == 0x86dd;
+}
+
+/* pio_build_kind lays out the rule that sends one kind of packet meeting m to
+ * its own hash, and returns its length. The Ethernet part is the match's own,
+ * so the same addresses and VLAN decide what arrives. */
+static size_t pio_build_kind(uint8_t *buf, uint8_t port,
+			     const struct pio_match *m, int kind)
+{
+	struct ibv_flow_attr *attr = (struct ibv_flow_attr *)buf;
+	struct ibv_flow_spec_eth eth;
+	int is6 = kind >= PIO_HASH_V6_UDP;
+	int l4 = 0;	/* IBV_FLOW_SPEC_TCP, IBV_FLOW_SPEC_UDP, or neither */
+	uint8_t *p;
+	int nspecs = 0;
+
+	if (kind == PIO_HASH_V4_UDP || kind == PIO_HASH_V6_UDP)
+		l4 = IBV_FLOW_SPEC_UDP;
+	if (kind == PIO_HASH_V4_TCP || kind == PIO_HASH_V6_TCP)
+		l4 = IBV_FLOW_SPEC_TCP;
+
+	memset(buf, 0, PIO_FLOW_BUF);
+	attr->type = IBV_FLOW_ATTR_NORMAL;
+	attr->port = port;
+	attr->priority = l4 ? PIO_PRIO_L4 : PIO_PRIO_L3;
+	p = buf + sizeof(struct ibv_flow_attr);
+
+	memset(&eth, 0, sizeof(eth));
+	eth.type = IBV_FLOW_SPEC_ETH;
+	eth.size = sizeof(eth);
+	if (!m->promisc && m->have_mac) {
+		memcpy(eth.val.dst_mac, m->dst_mac, 6);
+		memset(eth.mask.dst_mac, 0xff, 6);
+	}
+	if (!m->promisc && m->vlan >= 0) {
+		eth.val.vlan_tag = htobe16((uint16_t)(m->vlan & 0x0fff));
+		eth.mask.vlan_tag = htobe16(0x0fff);
+	}
+	eth.val.ether_type = htobe16(is6 ? 0x86dd : 0x0800);
+	eth.mask.ether_type = htobe16(0xffff);
+	memcpy(p, &eth, sizeof(eth));
+	p += sizeof(eth);
+	nspecs++;
+
+	/* No address is matched: the specification is there to say which
+	 * network layer the transport that follows sits in. */
+	if (is6) {
+		struct ibv_flow_spec_ipv6 ip6;
+		memset(&ip6, 0, sizeof(ip6));
+		ip6.type = IBV_FLOW_SPEC_IPV6;
+		ip6.size = sizeof(ip6);
+		memcpy(p, &ip6, sizeof(ip6));
+		p += sizeof(ip6);
+	} else {
+		struct ibv_flow_spec_ipv4 ip4;
+		memset(&ip4, 0, sizeof(ip4));
+		ip4.type = IBV_FLOW_SPEC_IPV4;
+		ip4.size = sizeof(ip4);
+		memcpy(p, &ip4, sizeof(ip4));
+		p += sizeof(ip4);
+	}
+	nspecs++;
+
+	if (l4) {
+		/* Likewise no port: naming the transport is the match. */
+		struct ibv_flow_spec_tcp_udp spec;
+		memset(&spec, 0, sizeof(spec));
+		spec.type = l4;
+		spec.size = sizeof(spec);
+		memcpy(p, &spec, sizeof(spec));
+		p += sizeof(spec);
+		nspecs++;
+	}
+
+	attr->num_of_specs = (uint8_t)nspecs;
+	attr->size = (uint16_t)(p - buf);
+	return (size_t)(p - buf);
 }
 
 /* pio_build_flow lays one rule into buf and returns its length, or 0 with err
@@ -719,31 +849,57 @@ int pio_group_steer(pio_ctx *c, struct pio_rx_group *g,
 	g->nflows = 0;
 
 	for (i = 0; i < n; i++) {
-		size_t len = pio_build_flow(buf, (uint8_t)c->port, &m[i], err, errlen);
-		int rc;
+		int v4, v6, rest, k;
 
-		if (len == 0) {
-			rc = -1;
-		} else {
-			g->flows[i] = ibv_create_flow(g->qp, (struct ibv_flow_attr *)buf);
-			if (g->flows[i]) {
-				g->nflows++;
+		pio_match_kinds(&m[i], &v4, &v6, &rest);
+
+		/* A rule per kind of packet the match lets in, each to the queue
+		 * pair that hashes that kind. */
+		for (k = 0; k < PIO_NHASH; k++) {
+			if (!(k >= PIO_HASH_V6_UDP ? v6 : v4))
 				continue;
+			pio_build_kind(buf, (uint8_t)c->port, &m[i], k);
+			g->flows[g->nflows] = ibv_create_flow(g->kind[k], (struct ibv_flow_attr *)buf);
+			if (!g->flows[g->nflows]) {
+				failf(err, errlen, "ibv_create_flow for rule %u of %u, hash %d",
+				      i + 1, n, k);
+				goto undo;
 			}
-			rc = failf(err, errlen, "ibv_create_flow for rule %u of %u", i + 1, n);
+			g->nflows++;
 		}
-		/* Leave nothing half-installed, whether the rule was refused
-		 * here or by the card. A partial rule set delivers some of what
-		 * was asked for, which is worse than none: nothing downstream
-		 * can tell the difference. */
-		while (i-- > 0) {
-			ibv_destroy_flow(g->flows[i]);
-			g->flows[i] = NULL;
+
+		/* The rule as asked for, when it says more than a kind does or
+		 * when packets that are not IP can meet it. In the second case
+		 * it goes last in the card's order and takes what the rules
+		 * above do not. */
+		if ((!v4 && !v6) || rest) {
+			size_t len = pio_build_flow(buf, (uint8_t)c->port, &m[i], err, errlen);
+
+			if (len == 0)
+				goto undo;
+			if (rest)
+				((struct ibv_flow_attr *)buf)->priority = PIO_PRIO_ANY;
+			g->flows[g->nflows] = ibv_create_flow(g->qp, (struct ibv_flow_attr *)buf);
+			if (!g->flows[g->nflows]) {
+				failf(err, errlen, "ibv_create_flow for rule %u of %u", i + 1, n);
+				goto undo;
+			}
+			g->nflows++;
 		}
-		g->nflows = 0;
-		return rc;
 	}
 	return 0;
+
+undo:
+	/* Leave nothing half-installed, whether the rule was refused here or by
+	 * the card. A partial rule set delivers some of what was asked for,
+	 * which is worse than none: nothing downstream can tell the
+	 * difference. */
+	while (g->nflows > 0) {
+		g->nflows--;
+		ibv_destroy_flow(g->flows[g->nflows]);
+		g->flows[g->nflows] = NULL;
+	}
+	return -1;
 }
 
 int pio_destroy_rx_group(struct pio_rx_group *g, char *err, size_t errlen)
@@ -761,13 +917,17 @@ int pio_destroy_rx_group(struct pio_rx_group *g, char *err, size_t errlen)
 		g->flows[i] = NULL;
 	}
 	g->nflows = 0;
-	if (g->qp) {
-		if ((e = ibv_destroy_qp(g->qp)) && !rc) {
+	/* kind[PIO_HASH_V4_UDP] is qp, so going through the kinds destroys it. */
+	for (int k = 0; k < PIO_NHASH; k++) {
+		if (!g->kind[k])
+			continue;
+		if ((e = ibv_destroy_qp(g->kind[k])) && !rc) {
 			errno = e;
 			rc = fail(err, errlen, "ibv_destroy_qp");
 		}
-		g->qp = NULL;
+		g->kind[k] = NULL;
 	}
+	g->qp = NULL;
 	if (g->ind_table) {
 		if ((e = ibv_destroy_rwq_ind_table(g->ind_table)) && !rc) {
 			errno = e;

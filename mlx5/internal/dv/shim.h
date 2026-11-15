@@ -144,12 +144,34 @@ struct pio_rxq {
  * only way several queues can share one kind of traffic: two rules matching the
  * same packets would not divide them, since a packet takes the first rule that
  * matches it. */
+/* The kinds of packet a group hashes. A queue pair hashes one kind: the fields
+ * it is told to hash name an IP version and a transport, and a packet of
+ * another version gets no hash at all and lands on the first queue. So each
+ * kind has a queue pair of its own over the same table, and a rule per kind
+ * sends each packet to the one that can hash it. */
+enum {
+	PIO_HASH_V4_UDP,
+	PIO_HASH_V4_TCP,
+	PIO_HASH_V4_IP,		/* any other IPv4: addresses only */
+	PIO_HASH_V6_UDP,
+	PIO_HASH_V6_TCP,
+	PIO_HASH_V6_IP,		/* any other IPv6: addresses only */
+	PIO_NHASH
+};
+
+/* PIO_RULES_PER_MATCH is how many rules in the card one alternative of a
+ * filter can become: one per kind, and one for what is not IP at all. */
+#define PIO_RULES_PER_MATCH (PIO_NHASH + 1)
+
 struct pio_rx_group {
 	void *ind_table;
+	/* qp is the IPv4 and UDP hash, and also where a rule that matches
+	 * something more particular than a kind sends its packets. */
 	void *qp;
+	void *kind[PIO_NHASH];	/* kind[PIO_HASH_V4_UDP] is qp */
 	/* A flow rule is a single conjunction, so a filter that is a union (two
 	 * ports, say) needs one rule per alternative. They all name this group. */
-	void *flows[PIO_MAX_FLOWS];
+	void *flows[PIO_MAX_FLOWS * PIO_RULES_PER_MATCH];
 	uint32_t nflows;
 };
 
