@@ -376,6 +376,13 @@ type RxQueue struct {
 	// has no way to ask whether a queue has something without taking it.
 	stash []packetio.Desc
 
+	// out is what Receive hands back when the packets came from the stash. It
+	// is a second array rather than the stash itself so that both keep their
+	// capacity: a receiver that waits with Poll takes most of its packets this
+	// way, and handing the stash's own array out left every Poll that found a
+	// packet growing a new one.
+	out []packetio.Desc
+
 	pinOnce sync.Once
 	pinCPU  atomic.Int64
 	pinErr  atomic.Pointer[error]
@@ -473,14 +480,14 @@ func (q *RxQueue) Receive(max int) []packetio.Desc {
 	q.autoPin()
 	if len(q.stash) > 0 {
 		// Whatever a Poll took comes first, or those packets would be lost.
-		if max >= len(q.stash) {
-			out := q.stash
-			q.stash = q.stash[:0:0]
-			return out
+		// Copied out, so the caller's slice is not the array the next Poll
+		// appends to, and what is left moves to the front.
+		if max > len(q.stash) {
+			max = len(q.stash)
 		}
-		out := q.stash[:max:max]
-		q.stash = q.stash[max:]
-		return out
+		q.out = append(q.out[:0], q.stash[:max]...)
+		q.stash = q.stash[:copy(q.stash, q.stash[max:])]
+		return q.out
 	}
 	return q.q.Receive(max)
 }
