@@ -3,6 +3,25 @@
 ## Unreleased
 
 **mlx5: IPv6 and TCP are spread across the receive queues.** The receive
+**dpdk: `Poke` no longer crashes iavf transmit queues.** `Poke` used to
+call `rte_eth_tx_done_cleanup` on the idle queue, and on iavf (DPDK
+25.11) that API walks the software ring with the scalar 16-byte
+`ci_tx_entry` stride on a queue the vector path drives as 8-byte
+`ci_tx_entry_vec` entries: it frees mbufs the driver still owns and
+nulls every other entry, and the next transmit burst dereferences a
+NULL and segfaults. A process under transmit load crash-looped about
+13 seconds after every start. `pio_tx_poke` now calls
+`rte_eth_tx_descriptor_status` only, which has no such state change:
+on mlx5 it is what runs the completion handler, and on iavf it only
+reads a descriptor's DD bit. An iavf queue drains its completions
+inside the next transmit burst instead, and the transmit path no
+longer clamps a burst to the free slots its own accounting reports,
+which on such a driver deadlocks the queue: the driver's short return
+is the backpressure now. Verified on an iavf VF under a 13.7 Gbps
+overload: 80M control frames sent, no crash.
+
+
+**mlx5: IPv6 and TCP are spread across the receive queues.** The receive
 group had one hash, over the IPv4 addresses and the UDP ports. A packet with
 none of those fields got no hash and went to the first queue, so all IPv6
 arrived on one queue: 11.7 Mpps of 111 offered on a 16-queue ConnectX-6. There

@@ -658,8 +658,17 @@ uint16_t pio_tx_burst(uint16_t port, uint16_t q, uint64_t *mbufs, uint16_t n)
 
 void pio_tx_poke(uint16_t port, uint16_t q)
 {
-	if (rte_eth_tx_done_cleanup(port, q, 0) == -ENOTSUP)
-		rte_eth_tx_descriptor_status(port, q, 0);
+	/* Not rte_eth_tx_done_cleanup: on iavf (DPDK 25.11) that API runs the
+	 * scalar ci_tx_entry cleanup on a queue the vector path drives as
+	 * ci_tx_entry_vec, freeing mbufs the driver still owns and nulling
+	 * every other sw_ring entry -- a crash in the next tx_burst's free
+	 * walk. rte_eth_tx_descriptor_status has no such state change: on
+	 * mlx5 it runs the completion handler (the only PMD that needs a
+	 * call to drain), and on iavf it only reads a descriptor's DD bit.
+	 * An iavf queue drains inside the next tx_burst instead, which is
+	 * what the queue accounting already tolerates.
+	 */
+	rte_eth_tx_descriptor_status(port, q, 0);
 }
 
 /* ------------------------------------------------------------ the steering */

@@ -30,9 +30,11 @@ type PMD interface {
 	// It exists because DPDK has no way to say "give me back what you have
 	// finished with". A PMD processes completions inside its own transmit
 	// burst and nowhere else, so a queue that has stopped sending never gets
-	// its last frames back. On mlx5, rte_eth_tx_done_cleanup is not
-	// implemented at all and rte_eth_tx_descriptor_status is what runs the
-	// completion handler; either way it is one call, on the idle path only.
+	// its last frames back. On mlx5, rte_eth_tx_descriptor_status is what
+	// runs the completion handler; on iavf it only reads a descriptor's DD
+	// bit, because iavf's rte_eth_tx_done_cleanup corrupts a vector-TX
+	// queue's software ring (scalar cleanup on a vector layout) and must
+	// not be called. Either way it is one call, on the idle path only.
 	Poke()
 }
 
@@ -302,9 +304,12 @@ func (t *Tx) Alloc(n int) []packetio.Desc {
 	if free := t.NumFreeSlots(); n > free {
 		if free == 0 {
 			t.Stats.RingFull.Add(1)
-			return nil
 		}
-		n = free
+		// No clamping to the accounting's idea of free slots: a PMD that only
+		// frees completed frames inside the next TxBurst (iavf) never drains
+		// unless the driver keeps being called, so the pool must keep handing
+		// out frames and let the driver's short return be the backpressure.
+		// Callers already Free the suffix Transmit does not accept.
 	}
 	if have := t.pool.Len(); n > have {
 		if have == 0 {
@@ -438,10 +443,18 @@ func (t *Tx) transmit(descs []packetio.Desc, offs []packetio.Offload) (int, erro
 	}
 	n := len(descs)
 	if free := t.NumFreeSlots(); n > free {
-		n = free
+		if free == 0 {
+			t.Stats.RingFull.Add(1)
+		}
+		// An iavf queue drains its completions only inside the next TxBurst,
+		// so our in_flight count overstates what the driver really holds
+		// once completions lag. Refusing to call the driver at all when the
+		// accounting says full deadlocks such a queue forever: nothing but a
+		// TxBurst ever drains it. Hand the driver the whole batch and let its
+		// own short return be the backpressure.
+		n = len(descs)
 	}
 	if n == 0 {
-		t.Stats.RingFull.Add(1)
 		return 0, nil
 	}
 	if n > len(t.mbufs) {
